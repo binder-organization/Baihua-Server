@@ -29,4 +29,3 @@ QWEN.md
 # Tests
 tests/logs
 tests/__pycache__
-pytest.ini

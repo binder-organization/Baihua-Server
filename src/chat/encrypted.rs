@@ -374,11 +374,13 @@ pub(crate) async fn start_grace_periods_for_user(
             continue;
         }
 
+        let grace_period =
+            Duration::from_secs(state.configuration.websocket.encrypted_grace_period_secs);
         state
             .connection_manager
-            .start_grace_period(room_id, user_id);
+            .start_grace_period(room_id, user_id, grace_period);
 
-        let grace_until = (Utc::now() + Duration::from_secs(30)).to_rfc3339();
+        let grace_until = (Utc::now() + grace_period).to_rfc3339();
         let msg = json!({
             "type": "encrypt_partner_disconnected",
             "data": {
@@ -398,14 +400,17 @@ pub(crate) async fn start_grace_periods_for_user(
     }
 }
 
-// Wait 30 seconds, then terminate if the user hasn't reconnected.
+// Delay cleanup until the configured reconnect grace period has passed.
 async fn grace_period_waiter(
     state: Arc<ServerState>,
     room_id: Uuid,
     offline_user_id: Uuid,
     pool: PgPool,
 ) {
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_secs(
+        state.configuration.websocket.encrypted_grace_period_secs,
+    ))
+    .await;
 
     // Check if the grace period is still active for this user+room.
     // If the user reconnected, cancel_grace_periods_for_user would have

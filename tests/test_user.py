@@ -1,6 +1,7 @@
 import re
 import uuid
 
+import pytest
 import requests
 
 
@@ -261,6 +262,7 @@ class TestValidationMiddleware:
 
 
 class TestLoginFullFlow:
+    @pytest.mark.smoke
     def test_register_then_login_success(self, session: requests.Session, base_url: str):
         """Full flow: register a user, then login, expect token back."""
         uname = _unique("flowtest")

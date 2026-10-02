@@ -1,7 +1,12 @@
-import tomllib
 from pathlib import Path
 
+import pytest
 import requests
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 
 def _server_version() -> str:
@@ -12,6 +17,7 @@ def _server_version() -> str:
 
 
 class TestGreet:
+    @pytest.mark.smoke
     def test_greet_ok(self, session: requests.Session, base_url: str):
         resp = session.get(f"{base_url}/greet")
         assert resp.status_code == 200

@@ -1,9 +1,6 @@
 """E2E tests for encrypted (E2EE) private chat.
 
-Tests follow the same patterns as test_chat.py:
-  - Helper functions for user registration, login, WS messages.
-  - Uses a class-level shared state across test methods.
-  - Tests run with the DB + server already up (via run_tests.py).
+Each scenario creates its own users and room, so it can run on its own.
 
 Scenarios:
   E1  – Create encrypted private room
@@ -25,8 +22,10 @@ Scenarios:
 """
 
 import json
+import os
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 
 import pytest
@@ -152,39 +151,137 @@ def _create_encrypted_room(
     return resp.json()["data"]["room"]["id"]
 
 
-# ── shared state ───────────────────────────────────────────────────
+@contextmanager
+def _active_encrypted_session(session: requests.Session, base_url: str, prefix: str):
+    token_a, user_a = _register_and_login(session, base_url, prefix=f"{prefix}a")
+    token_b, user_b = _register_and_login(session, base_url, prefix=f"{prefix}b")
+    room_id = _create_encrypted_room(session, base_url, token_a, token_b, user_b)
+    websocket_address = base_url.replace("http", "ws")
+    first_socket = _ws_connect(websocket_address, token_a)
+    try:
+        _recv(first_socket)
+        second_socket = _ws_connect(websocket_address, token_b)
+        try:
+            _recv(second_socket)
+            _send_ws(first_socket, {
+                "type": "encrypt_request",
+                "data": {
+                    "room_id": room_id,
+                    "public_key": "TestRequestKey",
+                    "identity_key": "TestRequestIdentity",
+                    "signature": "TestRequestSignature",
+                },
+            })
+            _drain_until(second_socket, "encrypt_invitation")
+            _send_ws(second_socket, {
+                "type": "encrypt_accept",
+                "data": {
+                    "room_id": room_id,
+                    "public_key": "TestAcceptKey",
+                    "identity_key": "TestAcceptIdentity",
+                    "signature": "TestAcceptSignature",
+                },
+            })
+            _drain_until(first_socket, "encrypt_accept_response")
+            _send_ws(first_socket, {
+                "type": "encrypt_ready", "data": {"room_id": room_id}
+            })
+            _send_ws(second_socket, {
+                "type": "encrypt_ready", "data": {"room_id": room_id}
+            })
+            _drain_until(first_socket, "encrypt_session_ready")
+            _drain_until(second_socket, "encrypt_session_ready")
+            yield room_id, token_a, user_a, first_socket, second_socket
+        finally:
+            second_socket.close()
+    finally:
+        first_socket.close()
 
-class _State:
-    pass
-
-
-# ── tests ──────────────────────────────────────────────────────────
 
 class EncryptedChatTest:
-    """12 scenarios for encrypted private chat."""
+    """Scenarios for encrypted private chat."""
+
+    @pytest.fixture(autouse=True)
+    def _prepare_encrypted_room(self, request, session: requests.Session, base_url: str):
+        if request.node.name not in {
+            "test_e2_room_detail_shows_encrypted",
+            "test_e3_encrypted_room_hides_preview",
+            "test_e4_encrypt_request_sends_invitation",
+            "test_e5_encrypt_accept_sends_response",
+            "test_e6_both_ready_activates_session",
+        }:
+            return
+
+        self.token_a, self.user_a = _register_and_login(
+            session, base_url, prefix="encrooma"
+        )
+        self.token_b, self.user_b = _register_and_login(
+            session, base_url, prefix="encroomb"
+        )
+        self.room_id = _create_encrypted_room(
+            session, base_url, self.token_a, self.token_b, self.user_b
+        )
+
+        if request.node.name in {
+            "test_e5_encrypt_accept_sends_response",
+            "test_e6_both_ready_activates_session",
+        }:
+            websocket_address = base_url.replace("http", "ws")
+            first_socket = _ws_connect(websocket_address, self.token_a)
+            try:
+                _recv(first_socket)
+                second_socket = _ws_connect(websocket_address, self.token_b)
+                try:
+                    _recv(second_socket)
+                    _send_ws(first_socket, {
+                        "type": "encrypt_request",
+                        "data": {
+                            "room_id": self.room_id,
+                            "public_key": "FixtureRequestKey",
+                            "identity_key": "FixtureRequestIdentity",
+                            "signature": "FixtureRequestSignature",
+                        },
+                    })
+                    _drain_until(second_socket, "encrypt_invitation")
+                    if request.node.name == "test_e6_both_ready_activates_session":
+                        _send_ws(second_socket, {
+                            "type": "encrypt_accept",
+                            "data": {
+                                "room_id": self.room_id,
+                                "public_key": "FixtureAcceptKey",
+                                "identity_key": "FixtureAcceptIdentity",
+                                "signature": "FixtureAcceptSignature",
+                            },
+                        })
+                        _drain_until(first_socket, "encrypt_accept_response")
+                finally:
+                    second_socket.close()
+            finally:
+                first_socket.close()
 
     @property
     def _room_id(self) -> str:
-        return EncryptedChatTest.room_id
+        return self.room_id
 
     @property
     def _token_a(self) -> str:
-        return EncryptedChatTest.token_a
+        return self.token_a
 
     @property
     def _token_b(self) -> str:
-        return EncryptedChatTest.token_b
+        return self.token_b
 
     @property
     def _user_a(self) -> dict:
-        return EncryptedChatTest.user_a
+        return self.user_a
 
     @property
     def _user_b(self) -> dict:
-        return EncryptedChatTest.user_b
+        return self.user_b
 
     # ── E1 ─────────────────────────────────────────────────────────────
 
+    @pytest.mark.smoke
     def test_e1_create_encrypted_room(
         self, session: requests.Session, base_url: str
     ) -> None:
@@ -216,11 +313,6 @@ class EncryptedChatTest:
         assert user_a["id"] in member_ids
         assert user_b["id"] in member_ids
 
-        EncryptedChatTest.room_id = room_id
-        EncryptedChatTest.token_a = token_a
-        EncryptedChatTest.token_b = token_b
-        EncryptedChatTest.user_a = user_a
-        EncryptedChatTest.user_b = user_b
 
     # ── E2 ─────────────────────────────────────────────────────────────
 
@@ -470,12 +562,6 @@ class EncryptedChatTest:
                 message_id = msg["data"]["id"]
                 uuid.UUID(message_id)
 
-                # store for E8
-                EncryptedChatTest.e7_room_id = room_id
-                EncryptedChatTest.e7_token_a = token_a
-                EncryptedChatTest.e7_token_b = token_b
-                EncryptedChatTest.e7_encrypted_msg_id = message_id
-                EncryptedChatTest.e7_ciphertext = ciphertext
             finally:
                 ws_b.close()
         finally:
@@ -486,29 +572,36 @@ class EncryptedChatTest:
     def test_e8_get_messages_returns_ciphertext(
         self, session: requests.Session, base_url: str
     ) -> None:
-        """E8 – GET /messages for encrypted room returns ciphertext, not content.
+        """E8 – GET /messages for encrypted room returns ciphertext, not content."""
+        ciphertext = "gANpcHl0aG9uIG9iamVjdC4AAAAAAAAA"
+        with _active_encrypted_session(session, base_url, "ence8") as (
+            room_id, token_a, _, first_socket, second_socket
+        ):
+            _send_ws(first_socket, {
+                "type": "encrypt_message",
+                "data": {"room_id": room_id, "ciphertext": ciphertext},
+            })
+            _drain_until(first_socket, "encrypted_message_sent")
+            message = _drain_until(second_socket, "new_encrypted_message")
+            message_id = message["data"]["id"]
 
-        Reads the message sent in E7."""
-        if not hasattr(EncryptedChatTest, "e7_room_id"):
-            pytest.skip("E7 did not run (dependency)")
         resp = session.get(
-            f"{base_url}/api/v1/chat/rooms/{EncryptedChatTest.e7_room_id}/messages",
-            headers=_auth(EncryptedChatTest.e7_token_a),
+            f"{base_url}/api/v1/chat/rooms/{room_id}/messages",
+            headers=_auth(token_a),
         )
         assert resp.status_code == 200, resp.text
 
         messages = resp.json()["data"]["messages"]
         assert len(messages) > 0
 
-        # Find the message from E7
         enc_msg = next(
-            (m for m in messages if m.get("id") == EncryptedChatTest.e7_encrypted_msg_id),
+            (m for m in messages if m.get("id") == message_id),
             None,
         )
         assert enc_msg is not None, "Encrypted message not found in message list"
 
         # Must have ciphertext, not content
-        assert enc_msg.get("ciphertext") == EncryptedChatTest.e7_ciphertext
+        assert enc_msg.get("ciphertext") == ciphertext
         assert enc_msg.get("content") is None
 
     # ── E9 ─────────────────────────────────────────────────────────────
@@ -565,17 +658,11 @@ class EncryptedChatTest:
 
                 # A disconnects → B should receive encrypt_partner_disconnected
                 ws_a.close()
-                time.sleep(0.3)
 
                 msg = _drain_until(ws_b, "encrypt_partner_disconnected")
                 assert msg["data"]["room_id"] == room_id
                 assert msg["data"]["offline_user_id"] == user_a["id"]
 
-                # Store for E10
-                EncryptedChatTest.e9_room_id = room_id
-                EncryptedChatTest.e9_token_a = token_a
-                EncryptedChatTest.e9_token_b = token_b
-                EncryptedChatTest.e9_user_a = user_a
             finally:
                 ws_b.close()
         finally:
@@ -589,48 +676,30 @@ class EncryptedChatTest:
     def test_e10_reconnect_within_grace_period(
         self, session: requests.Session, base_url: str
     ) -> None:
-        """E10 – User reconnects within grace period → session preserved.
-
-        Reuses the room from E9. A reconnects before 30s; the server cancels
-        the grace period and the session remains active. Verifies by sending
-        an encrypted message after reconnect."""
-        if not hasattr(EncryptedChatTest, "e9_room_id"):
-            pytest.skip("E9 did not run (dependency)")
+        """E10 – Reconnecting during the grace period preserves the session."""
         ws_base = base_url.replace("http", "ws")
-
-        # A reconnects
-        ws_a = _ws_connect(ws_base, EncryptedChatTest.e9_token_a)
-        try:
-            _drain_until(ws_a, "connected")
-            time.sleep(0.3)  # let cancel_grace_periods propagate
-
-            # B reconnects
-            ws_b = _ws_connect(ws_base, EncryptedChatTest.e9_token_b)
+        with _active_encrypted_session(session, base_url, "ence10") as (
+            room_id, token_a, _, first_socket, second_socket
+        ):
+            first_socket.close()
+            _drain_until(second_socket, "encrypt_partner_disconnected")
+            reconnected_socket = _ws_connect(ws_base, token_a)
             try:
-                _drain_until(ws_b, "connected")
-
-                # Both reconnected within grace period — session is preserved.
-                # Verify by sending an encrypted message.
-                _send_ws(ws_a, {
+                _drain_until(reconnected_socket, "connected")
+                _send_ws(reconnected_socket, {
                     "type": "encrypt_message",
                     "data": {
-                        "room_id": EncryptedChatTest.e9_room_id,
+                        "room_id": room_id,
                         "ciphertext": "UmVjb25uZWN0ZWRNc2c=",
                     },
                 })
-
-                # A receives ack
-                ack = _drain_until(ws_a, "encrypted_message_sent")
-                assert ack["data"]["room_id"] == EncryptedChatTest.e9_room_id
-
-                # B receives the ciphertext → session survived
-                msg = _drain_until(ws_b, "new_encrypted_message")
-                assert msg["data"]["room_id"] == EncryptedChatTest.e9_room_id
+                ack = _drain_until(reconnected_socket, "encrypted_message_sent")
+                assert ack["data"]["room_id"] == room_id
+                msg = _drain_until(second_socket, "new_encrypted_message")
+                assert msg["data"]["room_id"] == room_id
                 assert msg["data"]["ciphertext"] == "UmVjb25uZWN0ZWRNc2c="
             finally:
-                ws_b.close()
-        finally:
-            ws_a.close()
+                reconnected_socket.close()
 
     # ── E11 ───────────────────────────────────────────────────────────
 
@@ -689,16 +758,15 @@ class EncryptedChatTest:
 
                 # A disconnects fully
                 ws_a.close()
-                time.sleep(0.3)
 
                 # B receives partner_disconnected
                 _drain_until(ws_b, "encrypt_partner_disconnected")
 
-                # Wait for grace period to expire (30s + buffer)
-                time.sleep(32)
-
                 # B should receive encrypt_session_ended
-                msg = _drain_until(ws_b, "encrypt_session_ended", timeout=10)
+                grace_period = int(os.environ.get("BAIHUA_ENCRYPTED_GRACE_PERIOD_SECS", "30"))
+                msg = _drain_until(
+                    ws_b, "encrypt_session_ended", timeout=grace_period + 10
+                )
                 assert msg["data"]["room_id"] == room_id
                 assert msg["data"]["reason"] == "partner_timeout"
                 assert msg["data"]["offline_user_id"] == user_a["id"]
@@ -727,94 +795,17 @@ class EncryptedChatTest:
         """E12 – User sends encrypt_leave → session terminated immediately.
 
         Both receive encrypt_session_ended with reason=user_left."""
-        ws_base = base_url.replace("http", "ws")
-
-        # Establish session
-        ws_a = _ws_connect(ws_base, self._token_a)
-        try:
-            _recv(ws_a)
-            ws_b = _ws_connect(ws_base, self._token_b)
-            try:
-                _recv(ws_b)
-
-                # Need a fresh encrypted room since E11 purged the old one
-                token_c, user_c = _register_and_login(
-                    session, base_url, prefix="ence12c"
-                )
-                token_d, user_d = _register_and_login(
-                    session, base_url, prefix="ence12d"
-                )
-
-                room_id = _create_encrypted_room(
-                    session, base_url, token_c, token_d, user_d
-                )
-
-                # Create WS for C and D
-                ws_c = _ws_connect(ws_base, token_c)
-                try:
-                    _recv(ws_c)
-                    ws_d = _ws_connect(ws_base, token_d)
-                    try:
-                        _recv(ws_d)
-
-                        _send_ws(ws_c, {
-                            "type": "encrypt_request",
-                            "data": {
-                                "room_id": room_id,
-                                "public_key": "KeyCLeave",
-                                "identity_key": "IdKeyCLeave",
-                                "signature": "SigCLeave",
-                            },
-                        })
-                        _drain_until(ws_d, "encrypt_invitation")
-                        _send_ws(ws_d, {
-                            "type": "encrypt_accept",
-                            "data": {
-                                "room_id": room_id,
-                                "public_key": "KeyDLeave",
-                                "identity_key": "IdKeyDLeave",
-                                "signature": "SigDLeave",
-                            },
-                        })
-                        _drain_until(ws_c, "encrypt_accept_response")
-                        _send_ws(ws_c, {
-                            "type": "encrypt_ready",
-                            "data": {"room_id": room_id},
-                        })
-                        _send_ws(ws_d, {
-                            "type": "encrypt_ready",
-                            "data": {"room_id": room_id},
-                        })
-                        _drain_until(ws_c, "encrypt_session_ready")
-                        _drain_until(ws_d, "encrypt_session_ready")
-
-                        # C leaves
-                        _send_ws(ws_c, {
-                            "type": "encrypt_leave",
-                            "data": {"room_id": room_id},
-                        })
-
-                        # Both should receive encrypt_session_ended
-                        msg_c = _drain_until(ws_c, "encrypt_session_ended")
-                        assert msg_c["data"]["room_id"] == room_id
-                        assert msg_c["data"]["reason"] == "user_left"
-                        assert msg_c["data"]["offline_user_id"] == user_c["id"]
-
-                        msg_d = _drain_until(ws_d, "encrypt_session_ended")
-                        assert msg_d["data"]["room_id"] == room_id
-                        assert msg_d["data"]["reason"] == "user_left"
-                        assert msg_d["data"]["offline_user_id"] == user_c["id"]
-                    finally:
-                        ws_d.close()
-                finally:
-                    ws_c.close()
-            finally:
-                ws_b.close()
-        finally:
-            try:
-                ws_a.close()
-            except Exception:
-                pass
+        with _active_encrypted_session(session, base_url, "ence12") as (
+            room_id, _, user_a, first_socket, second_socket
+        ):
+            _send_ws(first_socket, {
+                "type": "encrypt_leave", "data": {"room_id": room_id}
+            })
+            for active_socket in (first_socket, second_socket):
+                message = _drain_until(active_socket, "encrypt_session_ended")
+                assert message["data"]["room_id"] == room_id
+                assert message["data"]["reason"] == "user_left"
+                assert message["data"]["offline_user_id"] == user_a["id"]
 
     # ── E13 ──────────────────────────────────────────────────────────
 

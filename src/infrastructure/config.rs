@@ -98,6 +98,8 @@ pub struct WebSocketConfiguration {
     pub message_rate_window_secs: u64,
     #[serde(default = "default_token_revalidate_interval_secs")]
     pub token_revalidate_interval_secs: u64,
+    #[serde(default = "default_encrypted_grace_period_secs")]
+    pub encrypted_grace_period_secs: u64,
     #[serde(default)]
     pub allowed_origins: Vec<String>,
 }
@@ -109,6 +111,7 @@ impl Default for WebSocketConfiguration {
             message_rate_limit: default_message_rate_limit(),
             message_rate_window_secs: default_message_rate_window_secs(),
             token_revalidate_interval_secs: default_token_revalidate_interval_secs(),
+            encrypted_grace_period_secs: default_encrypted_grace_period_secs(),
             allowed_origins: Vec::new(),
         }
     }
@@ -210,6 +213,9 @@ fn default_message_rate_window_secs() -> u64 {
 }
 fn default_token_revalidate_interval_secs() -> u64 {
     600
+}
+fn default_encrypted_grace_period_secs() -> u64 {
+    30
 }
 fn default_room_request_message_max_bytes() -> u32 {
     500
@@ -406,6 +412,10 @@ message_rate_window_secs = 10
 # active WebSocket connection. When omitted, defaults to 600 (10 min).
 token_revalidate_interval_secs = 600
 
+# Time allowed for an encrypted chat partner to reconnect after disconnecting.
+# When omitted, defaults to 30 seconds. Must be greater than 0.
+encrypted_grace_period_secs = 30
+
 # List of browser origins allowed to open a WebSocket connection. When a
 # browser sends an Origin header that is not in this list, the upgrade is
 # rejected with a 403. Non-browser clients (which send no Origin header)
@@ -511,6 +521,9 @@ max_bytes = 2097152
         }
         if self.websocket.token_revalidate_interval_secs == 0 {
             bail!("The WebSocket token revalidate interval cannot be 0.");
+        }
+        if self.websocket.encrypted_grace_period_secs == 0 {
+            bail!("The encrypted session grace period cannot be 0.");
         }
 
         if self.room_request.message_max_bytes == 0 {

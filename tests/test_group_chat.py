@@ -2,6 +2,7 @@ import json
 import time
 import uuid
 
+import pytest
 import requests
 import websocket
 
@@ -95,12 +96,50 @@ class _State:
 class TestGroupChat:
     """15 scenarios for the /api/v1/chat group room feature."""
 
+    @pytest.fixture(autouse=True)
+    def _prepare_group_room(self, request, session: requests.Session, base_url: str):
+        if request.node.name in {
+            "test_g1_create_group_room",
+            "test_g15_adjacent_surface_regression",
+        }:
+            return
+
+        self.user_b = _register_user(session, base_url, prefix="grproomb")
+        self.user_c = _register_user(session, base_url, prefix="grproomc")
+        self.token_admin, self.user_admin = _register_and_login(
+            session, base_url, prefix="grprooma"
+        )
+        usernames = [self.user_b["username"]]
+        if request.node.name != "test_g12_group_in_room_list":
+            usernames.append(self.user_c["username"])
+        response = session.post(
+            f"{base_url}/api/v1/chat/rooms",
+            json={"is_group": True, "name": "test-group", "usernames": usernames},
+            headers=self._auth(self.token_admin),
+        )
+        assert response.status_code == 201, response.text
+        self.room_id = response.json()["data"]["id"]
+
+        if request.node.name in {
+            "test_g6_list_members",
+            "test_g7_get_room_detail",
+            "test_g9_admin_kick",
+        }:
+            self.user_d = _register_user(session, base_url, prefix="grproomd")
+            response = session.post(
+                f"{base_url}/api/v1/chat/rooms/{self.room_id}/members",
+                json={"usernames": [self.user_d["username"]]},
+                headers=self._auth(self.token_admin),
+            )
+            assert response.status_code == 200, response.text
+
     @staticmethod
     def _auth(token: str) -> dict:
         return {"Authorization": f"Bearer {token}"}
 
     # ── G1 ────────────────────────────────────────────────────────────
 
+    @pytest.mark.smoke
     def test_g1_create_group_room(
         self, session: requests.Session, base_url: str
     ) -> None:
@@ -110,10 +149,10 @@ class TestGroupChat:
         A creates a group room with name and usernames [B, C].
         Expect 201, is_group=true, name matches."""
         # Register members first (no login needed for registration)
-        TestGroupChat.user_b = _register_user(session, base_url, prefix="grpb")
-        TestGroupChat.user_c = _register_user(session, base_url, prefix="grpc")
+        self.user_b = _register_user(session, base_url, prefix="grpb")
+        self.user_c = _register_user(session, base_url, prefix="grpc")
         # Admin registers and logs in
-        TestGroupChat.token_admin, TestGroupChat.user_admin = _register_and_login(
+        self.token_admin, self.user_admin = _register_and_login(
             session, base_url, prefix="grpa"
         )
 
@@ -123,11 +162,11 @@ class TestGroupChat:
                 "is_group": True,
                 "name": "test-group",
                 "usernames": [
-                    TestGroupChat.user_b["username"],
-                    TestGroupChat.user_c["username"],
+                    self.user_b["username"],
+                    self.user_c["username"],
                 ],
             },
-            headers=self._auth(TestGroupChat.token_admin),
+            headers=self._auth(self.token_admin),
         )
         assert resp.status_code == 201, resp.text
 
@@ -142,17 +181,15 @@ class TestGroupChat:
         # verify group room fields
         assert data["is_group"] is True
         assert data["name"] == "test-group"
-        assert data["created_by"] == TestGroupChat.user_admin["id"]
+        assert data["created_by"] == self.user_admin["id"]
 
         # exactly 3 members containing all 3 users
         members = data["members"]
         assert len(members) == 3
-        assert TestGroupChat.user_admin["id"] in members
-        assert TestGroupChat.user_b["id"] in members
-        assert TestGroupChat.user_c["id"] in members
+        assert self.user_admin["id"] in members
+        assert self.user_b["id"] in members
+        assert self.user_c["id"] in members
 
-        # persist for downstream tests
-        TestGroupChat.room_id = room_id
 
     # ── G2 ────────────────────────────────────────────────────────────
 
@@ -166,11 +203,11 @@ class TestGroupChat:
                 "is_group": True,
                 "name": "dup-group",
                 "usernames": [
-                    TestGroupChat.user_b["username"],
-                    TestGroupChat.user_b["username"],  # duplicate
+                    self.user_b["username"],
+                    self.user_b["username"],  # duplicate
                 ],
             },
-            headers=self._auth(TestGroupChat.token_admin),
+            headers=self._auth(self.token_admin),
         )
         assert resp.status_code == 400, resp.text
         assert resp.json()["code"] == "BAD_REQUEST_ERROR"
@@ -181,7 +218,7 @@ class TestGroupChat:
         self, session: requests.Session, base_url: str
     ) -> None:
         """G3 – Validation for missing/empty name and usernames."""
-        headers = self._auth(TestGroupChat.token_admin)
+        headers = self._auth(self.token_admin)
 
         # missing name
         resp = session.post(
@@ -228,12 +265,12 @@ class TestGroupChat:
 
         Register user D, then admin adds D via POST /members.
         Expect 200, added_count == 1."""
-        TestGroupChat.user_d = _register_user(session, base_url, prefix="grpd")
+        self.user_d = _register_user(session, base_url, prefix="grpd")
 
         resp = session.post(
-            f"{base_url}/api/v1/chat/rooms/{TestGroupChat.room_id}/members",
-            json={"usernames": [TestGroupChat.user_d["username"]]},
-            headers=self._auth(TestGroupChat.token_admin),
+            f"{base_url}/api/v1/chat/rooms/{self.room_id}/members",
+            json={"usernames": [self.user_d["username"]]},
+            headers=self._auth(self.token_admin),
         )
         assert resp.status_code == 200, resp.text
 
@@ -241,7 +278,7 @@ class TestGroupChat:
         assert body["code"] == "SUCCESS"
         data = body["data"]
         assert data["added_count"] == 1
-        assert data["added"][0]["username"] == TestGroupChat.user_d["username"]
+        assert data["added"][0]["username"] == self.user_d["username"]
 
     # ── G5 ────────────────────────────────────────────────────────────
 
@@ -253,7 +290,7 @@ class TestGroupChat:
         resp = session.post(
             f"{base_url}/api/v1/user/login",
             json={
-                "username": TestGroupChat.user_b["username"],
+                "username": self.user_b["username"],
                 "password": "P@ssw0rd!",
             },
         )
@@ -261,7 +298,7 @@ class TestGroupChat:
         token_b = resp.json()["data"]["token"]
 
         resp = session.post(
-            f"{base_url}/api/v1/chat/rooms/{TestGroupChat.room_id}/members",
+            f"{base_url}/api/v1/chat/rooms/{self.room_id}/members",
             json={"usernames": ["someuser"]},
             headers=self._auth(token_b),
         )
@@ -278,8 +315,8 @@ class TestGroupChat:
         Expect 4 members (A admin, B member, C member, D member)
         with correct role assignments."""
         resp = session.get(
-            f"{base_url}/api/v1/chat/rooms/{TestGroupChat.room_id}/members",
-            headers=self._auth(TestGroupChat.token_admin),
+            f"{base_url}/api/v1/chat/rooms/{self.room_id}/members",
+            headers=self._auth(self.token_admin),
         )
         assert resp.status_code == 200, resp.text
 
@@ -297,7 +334,7 @@ class TestGroupChat:
             assert "username" in m
             assert "role" in m
             assert "joined_at" in m
-            if m["user_id"] == TestGroupChat.user_admin["id"]:
+            if m["user_id"] == self.user_admin["id"]:
                 assert m["role"] == "admin"
                 admin_found = True
         assert admin_found, "Admin not found in members list"
@@ -311,8 +348,8 @@ class TestGroupChat:
 
         Verify is_group, name, member_count, and member structure."""
         resp = session.get(
-            f"{base_url}/api/v1/chat/rooms/{TestGroupChat.room_id}",
-            headers=self._auth(TestGroupChat.token_admin),
+            f"{base_url}/api/v1/chat/rooms/{self.room_id}",
+            headers=self._auth(self.token_admin),
         )
         assert resp.status_code == 200, resp.text
 
@@ -320,7 +357,7 @@ class TestGroupChat:
         assert body["code"] == "SUCCESS"
         data = body["data"]
 
-        assert data["id"] == TestGroupChat.room_id
+        assert data["id"] == self.room_id
         assert data["name"] == "test-group"
         assert data["is_group"] is True
         assert data["member_count"] == 4
@@ -346,7 +383,7 @@ class TestGroupChat:
         resp = session.post(
             f"{base_url}/api/v1/user/login",
             json={
-                "username": TestGroupChat.user_c["username"],
+                "username": self.user_c["username"],
                 "password": "P@ssw0rd!",
             },
         )
@@ -354,7 +391,7 @@ class TestGroupChat:
         token_c = resp.json()["data"]["token"]
 
         resp = session.delete(
-            f"{base_url}/api/v1/chat/rooms/{TestGroupChat.room_id}/members/{TestGroupChat.user_c['id']}",
+            f"{base_url}/api/v1/chat/rooms/{self.room_id}/members/{self.user_c['id']}",
             headers=self._auth(token_c),
         )
         assert resp.status_code == 200, resp.text
@@ -362,16 +399,16 @@ class TestGroupChat:
         body = resp.json()
         assert body["code"] == "SUCCESS"
         data = body["data"]
-        assert data["left_user_id"] == TestGroupChat.user_c["id"]
+        assert data["left_user_id"] == self.user_c["id"]
         assert data["room_deleted"] is False
 
         # verify user_c is no longer a member
         resp = session.get(
-            f"{base_url}/api/v1/chat/rooms/{TestGroupChat.room_id}/members",
-            headers=self._auth(TestGroupChat.token_admin),
+            f"{base_url}/api/v1/chat/rooms/{self.room_id}/members",
+            headers=self._auth(self.token_admin),
         )
         member_ids = [m["user_id"] for m in resp.json()["data"]["members"]]
-        assert TestGroupChat.user_c["id"] not in member_ids
+        assert self.user_c["id"] not in member_ids
 
     # ── G9 ────────────────────────────────────────────────────────────
 
@@ -383,23 +420,23 @@ class TestGroupChat:
         Admin removes user D. Expect 200, removed_user_id matches.
         Verify D is no longer in the member list."""
         resp = session.delete(
-            f"{base_url}/api/v1/chat/rooms/{TestGroupChat.room_id}/members/{TestGroupChat.user_d['id']}",
-            headers=self._auth(TestGroupChat.token_admin),
+            f"{base_url}/api/v1/chat/rooms/{self.room_id}/members/{self.user_d['id']}",
+            headers=self._auth(self.token_admin),
         )
         assert resp.status_code == 200, resp.text
 
         body = resp.json()
         assert body["code"] == "SUCCESS"
         data = body["data"]
-        assert data["removed_user_id"] == TestGroupChat.user_d["id"]
+        assert data["removed_user_id"] == self.user_d["id"]
 
         # verify user_d is no longer a member
         resp = session.get(
-            f"{base_url}/api/v1/chat/rooms/{TestGroupChat.room_id}/members",
-            headers=self._auth(TestGroupChat.token_admin),
+            f"{base_url}/api/v1/chat/rooms/{self.room_id}/members",
+            headers=self._auth(self.token_admin),
         )
         member_ids = [m["user_id"] for m in resp.json()["data"]["members"]]
-        assert TestGroupChat.user_d["id"] not in member_ids
+        assert self.user_d["id"] not in member_ids
 
     # ── G10 ───────────────────────────────────────────────────────────
 
@@ -416,7 +453,7 @@ class TestGroupChat:
 
         # get messages
         resp = session.get(
-            f"{base_url}/api/v1/chat/rooms/{TestGroupChat.room_id}/messages",
+            f"{base_url}/api/v1/chat/rooms/{self.room_id}/messages",
             headers=self._auth(token_x),
         )
         assert resp.status_code == 403, resp.text
@@ -424,7 +461,7 @@ class TestGroupChat:
 
         # get room detail
         resp = session.get(
-            f"{base_url}/api/v1/chat/rooms/{TestGroupChat.room_id}",
+            f"{base_url}/api/v1/chat/rooms/{self.room_id}",
             headers=self._auth(token_x),
         )
         assert resp.status_code == 403, resp.text
@@ -432,7 +469,7 @@ class TestGroupChat:
 
         # list members
         resp = session.get(
-            f"{base_url}/api/v1/chat/rooms/{TestGroupChat.room_id}/members",
+            f"{base_url}/api/v1/chat/rooms/{self.room_id}/members",
             headers=self._auth(token_x),
         )
         assert resp.status_code == 403, resp.text
@@ -447,23 +484,23 @@ class TestGroupChat:
 
         Expect message_sent ack, sender_id matches admin, content matches, room_id matches."""
         ws_base = base_url.replace("http", "ws")
-        ws = _ws_connect(ws_base, TestGroupChat.token_admin)
+        ws = _ws_connect(ws_base, self.token_admin)
         try:
             _recv(ws)  # consume "connected"
             ws.send(
                 json.dumps({
                     "type": "send_message",
                     "data": {
-                        "room_id": TestGroupChat.room_id,
+                        "room_id": self.room_id,
                         "content": "hello from group",
                     },
                 })
             )
             msg = _recv_until(ws, "message_sent")
             data = msg["data"]
-            assert data["sender_id"] == TestGroupChat.user_admin["id"]
+            assert data["sender_id"] == self.user_admin["id"]
             assert data["content"] == "hello from group"
-            assert data["room_id"] == TestGroupChat.room_id
+            assert data["room_id"] == self.room_id
         finally:
             ws.close()
 
@@ -478,12 +515,12 @@ class TestGroupChat:
         (2 remaining after G8 leave + G9 kick)."""
         resp = session.get(
             f"{base_url}/api/v1/chat/rooms",
-            headers=self._auth(TestGroupChat.token_admin),
+            headers=self._auth(self.token_admin),
         )
         assert resp.status_code == 200, resp.text
 
         rooms = resp.json()["data"]["rooms"]
-        group_rooms = [r for r in rooms if r["id"] == TestGroupChat.room_id]
+        group_rooms = [r for r in rooms if r["id"] == self.room_id]
         assert len(group_rooms) == 1
 
         room = group_rooms[0]
@@ -504,7 +541,7 @@ class TestGroupChat:
                 "name": "ghost-group",
                 "usernames": ["nonexistent_user_12345"],
             },
-            headers=self._auth(TestGroupChat.token_admin),
+            headers=self._auth(self.token_admin),
         )
         assert resp.status_code == 404, resp.text
         assert resp.json()["code"] == "NOT_FOUND_ERROR"
@@ -523,9 +560,9 @@ class TestGroupChat:
             json={
                 "is_group": True,
                 "name": "self-group",
-                "usernames": [TestGroupChat.user_admin["username"]],
+                "usernames": [self.user_admin["username"]],
             },
-            headers=self._auth(TestGroupChat.token_admin),
+            headers=self._auth(self.token_admin),
         )
         assert resp.status_code == 400, resp.text
         assert resp.json()["code"] == "BAD_REQUEST_ERROR"

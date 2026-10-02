@@ -1,557 +1,297 @@
 #!/usr/bin/env python3
-"""
-Baihua Server tests runner.
-
-Starts the server with PostgreSQL, runs pytest, cleans up.
-
-Modes:
-    (default)      DB in Docker, server binary local — fast, production-like
-    --docker       Full Docker mode (--profile production), like CI
-    --local        Local PostgreSQL, local binary
-
-Usage:
-    python3 tests/run_tests.py              # default
-    python3 tests/run_tests.py --docker     # pure Docker (long build)
-    python3 tests/run_tests.py --local      # local PostgreSQL
-    python3 tests/run_tests.py --keep       # keep server running after tests
-    python3 tests/run_tests.py --skip-checks  # skip cargo fmt + clippy
-"""
+"""Run the integration suite against an isolated server and database."""
 
 import argparse
-import collections
-import datetime
 import os
-import signal
+import shutil
+import socket
 import subprocess
 import sys
-import threading
+import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
-from io import StringIO
-
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVER_PORT = 2424
-DB_PORT_ENV = 5432  # local PostgreSQL default
-DB_PORT_DOCKER = 2423  # docker compose mapped port
-LOG_DIR = os.path.join(PROJECT_ROOT, "tests", "logs")
-
-_log_file = None  # set by setup_logging()
-_log_stream = StringIO()  # in-memory capture of everything
+from collections import deque
+from pathlib import Path
 
 
-def setup_logging():
-    """Create log file and directory. Returns the log file path."""
-    global _log_file
-    os.makedirs(LOG_DIR, exist_ok=True)
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(LOG_DIR, f"run_{ts}.log")
-    _log_file = open(path, "w")  # noqa: SIM115
-    return path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+TEST_COMPOSE_FILE = PROJECT_ROOT / "tests" / "compose.test.yml"
+LOG_DIRECTORY = PROJECT_ROOT / "tests" / "logs"
+EXPECTED_TEST_CLASSES = (
+    "tests/test_chat.py::ChatTest::",
+    "tests/test_group_chat.py::TestGroupChat::",
+    "tests/test_encrypted_chat.py::EncryptedChatTest::",
+    "tests/test_room_requests.py::RoomRequestChatTest::",
+)
 
 
-def log(msg):
-    """Print to console + write to in-memory buffer and log file."""
-    text = f"[tests-runner] {msg}"
-    print(text, flush=True)
-    print(text, file=_log_stream, flush=True)
-    if _log_file:
-        _log_file.write(text + "\n")
-        _log_file.flush()
-
-
-def log_file_path():
-    """Return the current log file path (None if not set up yet)."""
-    return _log_file.name if _log_file else None
-
-
-# Circular buffer of the most recent server stdout lines, used by the
-# failure diagnostics below.
-_server_output_lines = collections.deque(maxlen=200)
-
-
-def drain_server_stdout(server_proc):
-    """Read the server stdout continuously so a full pipe never blocks it."""
-    lines = server_proc.stdout if server_proc.stdout is not None else None
-    if lines is None:
-        return
-    for raw in iter(lines.readline, b""):
-        text = raw.decode(errors="replace").rstrip()
-        _server_output_lines.append(text)
-        if _log_file:
-            _log_file.write(f"  [server] {text}\n")
-
-
-def start_server(binary, env):
-    """Start the server with a stdout drain thread. Returns (proc, pipe_w)."""
-    pipe_r, pipe_w = os.pipe()
-    server_proc = subprocess.Popen(
-        [binary],
-        stdin=pipe_r,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=env,
-        cwd=PROJECT_ROOT,
-        pass_fds=(pipe_r,),
-    )
-    os.close(pipe_r)
-    threading.Thread(
-        target=drain_server_stdout, args=(server_proc,), daemon=True
-    ).start()
-    return server_proc, pipe_w
-
-
-def find_server_binary():
-    """Locate the server binary (debug first, then release)."""
-    candidates = [
-        os.path.join(PROJECT_ROOT, "target", "debug", "baihua-server"),
-        os.path.join(PROJECT_ROOT, "target", "release", "baihua-server"),
-    ]
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    return None
-
-
-def check_postgres_local():
-    """Check if local PostgreSQL is accepting connections."""
-    import psycopg2
-
-    try:
-        conn = psycopg2.connect(
-            host="localhost",
-            port=DB_PORT_ENV,
-            user=os.environ.get("USER", "postgres"),
-            dbname="postgres",
-        )
-        conn.close()
-        return {"host": "localhost", "port": DB_PORT_ENV, "type": "local"}
-    except Exception:
-        return None
-
-
-def check_postgres_docker():
-    """Check if Docker PostgreSQL is running on mapped port."""
-    import psycopg2
-
-    try:
-        conn = psycopg2.connect(
-            host="localhost",
-            port=DB_PORT_DOCKER,
-            user="baihua_user",
-            password="password",
-            dbname="baihua-database",
-        )
-        conn.close()
-        return {"host": "localhost", "port": DB_PORT_DOCKER, "type": "docker"}
-    except Exception:
-        return None
-
-
-def setup_database_local(db_info):
-    """Create baihua_user and baihua-database if they don't exist."""
-    import psycopg2
-
-    conn = psycopg2.connect(
-        host=db_info["host"],
-        port=db_info["port"],
-        user=os.environ.get("USER", "postgres"),
-        dbname="postgres",
-    )
-    conn.autocommit = True
-    cur = conn.cursor()
-
-    # Create role if not exists
-    cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'baihua_user'")
-    if cur.fetchone() is None:
-        cur.execute("CREATE ROLE baihua_user WITH LOGIN PASSWORD 'password'")
-        log("Created role baihua_user")
-
-    # Create database if not exists
-    cur.execute("SELECT 1 FROM pg_database WHERE datname = 'baihua-database'")
-    if cur.fetchone() is None:
-        cur.execute(
-            "CREATE DATABASE \"baihua-database\" OWNER baihua_user"
-        )
-        log("Created database baihua-database")
-
-    cur.close()
-    conn.close()
-
-
-def wait_for_server(url, timeout=60):
-    """Poll endpoint until it returns 200 or timeout."""
-    import urllib.request
-    import urllib.error
-
-    for i in range(timeout):
-        try:
-            resp = urllib.request.urlopen(url, timeout=2)
-            if resp.status == 200:
-                return True
-        except (urllib.error.URLError, ConnectionRefusedError, OSError):
-            pass
-        time.sleep(1)
-    return False
-
-
-def docker_is_available():
-    """Quick check if Docker daemon is running (exit code 0 = yes)."""
-    try:
-        result = subprocess.run(
-            ["docker", "info"],
-            capture_output=True, timeout=10,
-        )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
-        return False
+def log(message):
+    print(f"[tests-runner] {message}", flush=True)
 
 
 def run_checks():
-    """Run cargo fmt --check and clippy. Return False if any check fails."""
-    checks = [
-        ("cargo fmt --check", ["cargo", "fmt", "--check"]),
-        ("cargo clippy", ["cargo", "clippy", "--locked", "--", "-D", "warnings"]),
+    checks = (
+        ("formatting", ["cargo", "fmt", "--check"]),
+        ("linting", ["cargo", "clippy", "--locked", "--", "-D", "warnings"]),
+    )
+    for label, command in checks:
+        log(f"Checking {label}...")
+        result = subprocess.run(command, cwd=PROJECT_ROOT, capture_output=True, text=True)
+        if result.returncode:
+            print(result.stdout, end="")
+            print(result.stderr, end="", file=sys.stderr)
+            return False
+    return True
+
+
+def verify_collection():
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "tests"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        return False
+    missing_classes = [
+        class_name for class_name in EXPECTED_TEST_CLASSES
+        if class_name not in result.stdout
     ]
-    all_passed = True
-    for name, cmd in checks:
-        log(f"Running {name}...")
-        result = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True)
-        if result.returncode != 0:
-            log(f"{name} FAILED:")
-            print(result.stdout)
-            print(result.stderr)
-            all_passed = False
-        else:
-            log(f"{name} passed")
-    return all_passed
+    if missing_classes:
+        log(f"Test collection missed: {', '.join(missing_classes)}")
+        return False
+    log(result.stdout.splitlines()[-1])
+    return True
 
 
-def _run_docker(args):
-    """Pure Docker mode: build + run everything in containers (like CI)."""
-    log_path = log_file_path()
-    timeout = 1200  # 20 min for full Docker build + compile
+def choose_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
 
-    log("Starting docker compose --profile production (timeout: 1200s)...")
-    env_ci_path = os.path.join(PROJECT_ROOT, ".env.ci")
-    with open(env_ci_path, "w") as f:
-        f.write("\n".join([
-            "JWT_SECRET=docker-tests-jwt-not-for-production",
-            "POSTGRES_USER=baihua_test",
-            "POSTGRES_PASSWORD=test_pass",
-            "POSTGRES_DB=baihua_test",
-        ]))
-    try:
+
+class TestRun:
+    def __init__(self):
+        self.identifier = uuid.uuid4().hex[:12]
+        self.project_name = f"baihua-test-{self.identifier}"
+        self.temporary_directory = Path(
+            tempfile.mkdtemp(prefix=f"{self.project_name}-")
+        )
+        LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        self.server_log_path = LOG_DIRECTORY / f"server_{self.identifier}.log"
+        self.server_log_file = None
+        self.server_process = None
+        self.compose_started = False
+        self.server_url = None
+        self.environment = os.environ.copy()
+        self.environment.update({
+            "POSTGRES_USER": f"baihua_test_{self.identifier}",
+            "POSTGRES_PASSWORD": uuid.uuid4().hex + uuid.uuid4().hex,
+            "POSTGRES_DB": f"baihua_test_{self.identifier}",
+            "JWT_SECRET": uuid.uuid4().hex + uuid.uuid4().hex,
+            "BAIHUA_ENCRYPTED_GRACE_PERIOD_SECS": "5",
+        })
+
+    def compose_command(self, *arguments):
+        return [
+            "docker", "compose", "-f", str(TEST_COMPOSE_FILE),
+            "-p", self.project_name, *arguments,
+        ]
+
+    def compose(self, *arguments, timeout=120):
         result = subprocess.run(
-            ["docker", "compose", "--profile", "production", "--env-file", env_ci_path, "up", "-d", "--build"],
-            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout,
+            self.compose_command(*arguments),
+            cwd=PROJECT_ROOT,
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
-        if result.returncode != 0:
-            log("docker compose --profile production failed!")
-            log("--- stderr ---")
-            log(result.stderr)
-            log("--- stdout ---")
-            log(result.stdout)
-            log(f"Full log saved to: {log_path}")
-            sys.exit(1)
-    except subprocess.TimeoutExpired:
-        log(f"docker compose timed out after {timeout}s")
-        log("If this is a large build, increase the timeout in tests/run_tests.py")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        log("\nInterrupted, cleaning up...")
-        subprocess.run(
-            ["docker", "compose", "--profile", "production", "down", "-v"],
-            cwd=PROJECT_ROOT, capture_output=True,
+        if result.returncode:
+            raise RuntimeError(result.stderr or result.stdout)
+        return result.stdout.strip()
+
+    def mapped_port(self, service, internal_port, profile=None):
+        arguments = [] if profile is None else ["--profile", profile]
+        output = self.compose(*arguments, "port", service, str(internal_port))
+        return int(output.rsplit(":", 1)[-1])
+
+    def start_database(self):
+        self.compose_started = True
+        self.compose("up", "-d", "--wait", "database")
+        self.environment["POSTGRES_HOST"] = "127.0.0.1"
+        self.environment["POSTGRES_PORT"] = str(self.mapped_port("database", 5432))
+        log(f"Isolated database: {self.project_name}")
+
+    def use_explicit_local_database(self):
+        required = (
+            "POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_USER",
+            "POSTGRES_PASSWORD", "POSTGRES_DB",
         )
-        sys.exit(130)
-    finally:
-        if os.path.exists(env_ci_path):
-            os.unlink(env_ci_path)
-
-    log("Waiting for server to become healthy...")
-    healthy = wait_for_server(f"http://localhost:{SERVER_PORT}/health")
-    if not healthy:
-        log("Server did not become healthy!")
-        logs = subprocess.run(
-            ["docker", "compose", "logs"],
-            cwd=PROJECT_ROOT, capture_output=True, text=True,
-        )
-        log("--- docker compose logs ---")
-        log(logs.stdout)
-        sys.exit(1)
-    log("Server is healthy!")
-
-    log("Running pytest...")
-    test_exit = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/", "-v", "--tb=short"],
-        cwd=PROJECT_ROOT,
-    ).returncode
-
-    if not args.keep:
-        log("Stopping docker compose...")
-        subprocess.run(
-            ["docker", "compose", "--profile", "production", "down", "-v"],
-            cwd=PROJECT_ROOT, capture_output=True,
-        )
-
-    if test_exit == 0:
-        log("All tests passed! ✅")
-    else:
-        log(f"Tests failed (exit code {test_exit}) ❌")
-    sys.exit(test_exit)
-
-
-def _run_default(args):
-    """Default path: DB in Docker, server binary local (fast, production-like)."""
-    log_path = log_file_path()
-    env = os.environ.copy()
-
-    # ── Phase 1: Build local binary ────────────────────────────────
-    log("Building server (cargo build)...")
-    result = subprocess.run(
-        ["cargo", "build"],
-        cwd=PROJECT_ROOT, capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        log(f"Build failed:\n{result.stderr}")
-        sys.exit(1)
-
-    binary = find_server_binary()
-    if not binary:
-        log("Server binary not found after build!")
-        sys.exit(1)
-
-    # ── Phase 2: Start Docker database ─────────────────────────────
-    log("Starting Docker Compose (database only)...")
-    # Clean up any previous container + volume for a fresh start
-    subprocess.run(
-        ["docker", "compose", "down", "-v"],
-        cwd=PROJECT_ROOT, capture_output=True,
-    )
-    result = subprocess.run(
-        ["docker", "compose", "up", "-d", "database"],
-        cwd=PROJECT_ROOT, capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        log("Failed to start Docker database!")
-        log("--- stderr ---")
-        log(result.stderr)
-        log("--- stdout ---")
-        log(result.stdout)
-        sys.exit(1)
-
-    log("Waiting for Docker database...")
-    for i in range(30):
-        result = subprocess.run(
-            ["docker", "compose", "exec", "database", "pg_isready", "-U", "baihua_user", "-d", "baihua-database"],
-            cwd=PROJECT_ROOT, capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            break
-        time.sleep(2)
-    else:
-        log("Database did not become ready!")
-        log("--- docker compose logs database ---")
-        logs = subprocess.run(
-            ["docker", "compose", "logs", "database"],
-            cwd=PROJECT_ROOT, capture_output=True, text=True,
-        )
-        log(logs.stdout)
-        sys.exit(1)
-
-    # Set production-like environment variables
-    env["POSTGRES_HOST"] = "localhost"
-    env["POSTGRES_PORT"] = str(DB_PORT_DOCKER)
-    env["POSTGRES_USER"] = "baihua_user"
-    env["POSTGRES_PASSWORD"] = "password"
-    env["POSTGRES_DB"] = "baihua-database"
-    env["BAIHUA_ENV"] = "production"
-    env["JWT_SECRET"] = f"tests-jwt-{uuid.uuid4().hex}"
-
-    # In production mode the server looks for ./migrations/ next to the
-    # binary (target/debug/). Symlink so it finds them.
-    binary_dir = os.path.dirname(binary)
-    link = os.path.join(binary_dir, "migrations")
-    if not os.path.islink(link) and not os.path.isdir(link):
-        os.symlink(
-            os.path.join(PROJECT_ROOT, "migrations"),
-            link,
-            target_is_directory=True,
-        )
-
-    # ── Phase 3: Start server ─────────────────────────────────────
-    log(f"Starting server ({binary})...")
-    server_proc, pipe_w = start_server(binary, env)
-
-    # ── Phase 4: Wait for health ──────────────────────────────────
-    log("Waiting for server to become healthy...")
-    healthy = wait_for_server(f"http://localhost:{SERVER_PORT}/health")
-    if not healthy:
-        log("Server did not become healthy!")
-        server_proc.terminate()
-        try:
-            server_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server_proc.kill()
-            server_proc.wait()
-        if _server_output_lines:
-            log("--- server output (last 30 lines) ---")
-            for line in list(_server_output_lines)[-30:]:
-                log(f"  {line}")
-        os.close(pipe_w)
-        log(f"Full log saved to: {log_path}")
-        sys.exit(1)
-    log("Server is healthy!")
-
-    # ── Phase 5: Run tests ────────────────────────────────────────
-    log("Running pytest...")
-    test_exit = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/", "-v", "--tb=short"],
-        cwd=PROJECT_ROOT,
-    ).returncode
-
-    # ── Phase 6: Cleanup ──────────────────────────────────────────
-    if not args.keep:
-        log("Stopping server...")
-        os.close(pipe_w)
-        server_proc.send_signal(signal.SIGINT)
-        try:
-            server_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server_proc.kill()
-            server_proc.wait()
-
-        log("Stopping Docker Compose...")
-        subprocess.run(
-            ["docker", "compose", "down"],
-            cwd=PROJECT_ROOT, capture_output=True,
-        )
-
-    if test_exit == 0:
-        log("All tests passed! ✅")
-    else:
-        log(f"Tests failed (exit code {test_exit}) ❌")
-    sys.exit(test_exit)
-
-
-def _run_local(args):
-    """Local path: build binary, connect to local/auto-detected PostgreSQL."""
-    # ── Phase 1: Build ────────────────────────────────────────────
-    log("Building server (cargo build)...")
-    result = subprocess.run(
-        ["cargo", "build"],
-        cwd=PROJECT_ROOT, capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        log(f"Build failed:\n{result.stderr}")
-        sys.exit(1)
-
-    binary = find_server_binary()
-    if not binary:
-        log("Server binary not found after build!")
-        sys.exit(1)
-
-    # ── Phase 2: Database ─────────────────────────────────────────
-    env = os.environ.copy()
-    db_info = None
-
-    try:
-        import psycopg2  # noqa: F401
-    except ImportError:
-        log("psycopg2 not installed. Install with: pip install psycopg2-binary")
-        sys.exit(1)
-
-    local = check_postgres_local()
-    if local:
-        db_info = local
-        setup_database_local(local)
-        env["POSTGRES_PORT"] = str(DB_PORT_ENV)
-    else:
-        docker_db = check_postgres_docker()
-        if docker_db:
-            db_info = docker_db
-        else:
-            log(
-                "No PostgreSQL found. Run 'docker compose up -d database' or "
-                "install PostgreSQL locally."
+        if any(not os.environ.get(name) for name in required):
+            raise RuntimeError(
+                "Local mode requires explicit PostgreSQL connection variables."
             )
-            sys.exit(1)
-    env["BAIHUA_ENV"] = "development"
+        if os.environ["POSTGRES_HOST"] not in ("localhost", "127.0.0.1", "::1"):
+            raise RuntimeError("Local mode only accepts a local PostgreSQL host.")
+        if not os.environ["POSTGRES_DB"].startswith("baihua_test_"):
+            raise RuntimeError("Local mode requires a baihua_test_ database name.")
+        self.environment.update({name: os.environ[name] for name in required})
+        log(f"Using explicitly selected test database: {self.environment['POSTGRES_DB']}")
 
-    # ── Phase 3: Start server ─────────────────────────────────────
-    log(f"Starting server ({binary})...")
-    server_proc, pipe_w = start_server(binary, env)
+    def write_server_configuration(self, port):
+        app_directory = self.temporary_directory / "app"
+        app_directory.mkdir()
+        (app_directory / "config.toml").write_text(
+            f'[web]\nhost = "127.0.0.1"\nport = {port}\n'
+            "[logs]\n[database]\n[user]\n",
+            encoding="utf-8",
+        )
+        self.environment["BAIHUA_DIR"] = str(app_directory)
 
-    # ── Phase 4: Wait for health ──────────────────────────────────
-    log("Waiting for server to become healthy...")
-    healthy = wait_for_server(f"http://localhost:{SERVER_PORT}/health")
-    if not healthy:
-        log("Server did not become healthy!")
-        server_proc.terminate()
-        try:
-            server_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server_proc.kill()
-            server_proc.wait()
-        if _server_output_lines:
-            log("--- server output (last 30 lines) ---")
-            for line in list(_server_output_lines)[-30:]:
-                log(f"  {line}")
-        os.close(pipe_w)
-        log(f"Full log saved to: {log_file_path()}")
-        sys.exit(1)
-    log("Server is healthy!")
+    def start_local_server(self):
+        build = subprocess.run(
+            ["cargo", "build", "--locked"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        if build.returncode:
+            raise RuntimeError(build.stderr or build.stdout)
 
-    # ── Phase 5: Run tests ────────────────────────────────────────
-    log("Running pytest...")
-    test_exit = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/", "-v", "--tb=short"],
-        cwd=PROJECT_ROOT,
-    ).returncode
+        binary = self.temporary_directory / "baihua-server"
+        shutil.copy2(PROJECT_ROOT / "target" / "debug" / "baihua-server", binary)
+        (self.temporary_directory / "migrations").symlink_to(
+            PROJECT_ROOT / "migrations", target_is_directory=True
+        )
+        port = choose_port()
+        self.write_server_configuration(port)
+        self.environment["BAIHUA_ENV"] = "production"
+        self.server_log_file = self.server_log_path.open("w", encoding="utf-8")
+        self.server_process = subprocess.Popen(
+            [str(binary)],
+            cwd=PROJECT_ROOT,
+            env=self.environment,
+            stdin=subprocess.DEVNULL,
+            stdout=self.server_log_file,
+            stderr=subprocess.STDOUT,
+        )
+        self.server_url = f"http://127.0.0.1:{port}"
+        self.wait_until_healthy()
 
-    # ── Phase 6: Cleanup ──────────────────────────────────────────
-    if not args.keep:
-        log("Stopping server...")
-        os.close(pipe_w)
-        server_proc.send_signal(signal.SIGINT)
-        try:
-            server_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server_proc.kill()
-            server_proc.wait()
+    def start_container_server(self):
+        self.compose("--profile", "container", "up", "-d", "--build", "--wait", "server", timeout=1200)
+        port = self.mapped_port("server", 2424, profile="container")
+        self.server_url = f"http://127.0.0.1:{port}"
+        self.wait_until_healthy()
 
-    if test_exit == 0:
-        log("All tests passed! ✅")
-    else:
-        log(f"Tests failed (exit code {test_exit}) ❌")
-    sys.exit(test_exit)
+    def wait_until_healthy(self):
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if self.server_process is not None and self.server_process.poll() is not None:
+                raise RuntimeError(self.server_log_tail())
+            try:
+                with urllib.request.urlopen(f"{self.server_url}/health", timeout=2) as response:
+                    if response.status == 200:
+                        log(f"Server ready: {self.server_url}")
+                        return
+            except (urllib.error.URLError, TimeoutError, OSError):
+                pass
+            time.sleep(0.5)
+        raise RuntimeError(f"Server did not become healthy. {self.server_log_tail()}")
+
+    def server_log_tail(self):
+        if not self.server_log_path.exists():
+            return "No server log was created."
+        with self.server_log_path.open(encoding="utf-8", errors="replace") as log_file:
+            return "\n".join(deque(log_file, maxlen=30))
+
+    def run_tests(self, arguments):
+        self.environment["BAIHUA_TEST_BASE_URL"] = self.server_url
+        selected = arguments.test or ["tests"]
+        command = [sys.executable, "-m", "pytest", *selected, "-v", "--tb=short"]
+        if arguments.smoke:
+            command.extend(["-m", "smoke"])
+        return subprocess.run(
+            command, cwd=PROJECT_ROOT, env=self.environment
+        ).returncode
+
+    def cleanup(self):
+        if self.server_process is not None and self.server_process.poll() is None:
+            self.server_process.terminate()
+            try:
+                self.server_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.server_process.kill()
+                self.server_process.wait()
+        if self.server_log_file is not None:
+            self.server_log_file.close()
+        if self.compose_started and self.project_name.startswith("baihua-test-"):
+            try:
+                self.compose("down", "-v", "--remove-orphans")
+            except (RuntimeError, subprocess.TimeoutExpired) as error:
+                log(f"Could not clean up {self.project_name}: {error}")
+        shutil.rmtree(self.temporary_directory)
+
+    def describe_kept_resources(self):
+        log(f"Kept server: {self.server_url}")
+        log(f"Kept temporary directory: {self.temporary_directory}")
+        if self.compose_started:
+            log(f"Kept container project: {self.project_name}")
+            log("Clean it with: " + " ".join(self.compose_command("down", "-v")))
+        if self.server_log_file is not None:
+            self.server_log_file.close()
 
 
 def run():
-    parser = argparse.ArgumentParser(description="Run baihua-server integration tests")
-    parser.add_argument("--docker", action="store_true", help="Full Docker mode (build + run everything in containers, like CI)")
-    parser.add_argument("--local", action="store_true", help="Use local PostgreSQL instead of Docker")
-    parser.add_argument("--keep", action="store_true", help="Keep server running after tests")
-    parser.add_argument("--skip-checks", action="store_true", help="Skip cargo fmt + clippy pre-flight checks")
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--docker", action="store_true", help="Run the server in a container")
+    parser.add_argument("--local", action="store_true", help="Use an explicit local test database")
+    parser.add_argument("--keep", action="store_true", help="Keep resources for inspection")
+    parser.add_argument("--skip-checks", action="store_true", help="Skip formatting and linting checks")
+    parser.add_argument("--smoke", action="store_true", help="Run critical smoke scenarios")
+    parser.add_argument("--test", action="append", help="Select a test path or node; repeat as needed")
+    arguments = parser.parse_args()
+    if arguments.docker and arguments.local:
+        parser.error("--docker and --local cannot be combined")
+    if sys.version_info < (3, 10):
+        log("Python 3.10 or newer is required.")
+        return 1
+    if not arguments.skip_checks and not run_checks():
+        return 1
+    if not verify_collection():
+        return 1
 
-    log_path = setup_logging()
-    log(f"Log file: {log_path}")
-
-    # ── Phase 0: Pre-flight checks ─────────────────────────────────
-    if not args.skip_checks:
-        if not run_checks():
-            sys.exit(1)
-    else:
-        log("Skipping pre-flight checks")
-
-    if args.docker:
-        _run_docker(args)
-    elif args.local:
-        _run_local(args)
-    else:
-        _run_default(args)
+    test_run = TestRun()
+    completed = False
+    try:
+        if arguments.local:
+            test_run.use_explicit_local_database()
+        else:
+            test_run.start_database()
+        if arguments.docker:
+            test_run.start_container_server()
+        else:
+            test_run.start_local_server()
+        result = test_run.run_tests(arguments)
+        completed = True
+        return result
+    except KeyboardInterrupt:
+        log("Interrupted.")
+        return 130
+    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError) as error:
+        log(f"Test environment failed: {error}")
+        return 1
+    finally:
+        if arguments.keep and completed:
+            test_run.describe_kept_resources()
+        else:
+            test_run.cleanup()
 
 
 if __name__ == "__main__":
-    run()
+    sys.exit(run())

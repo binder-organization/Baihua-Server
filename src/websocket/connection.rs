@@ -255,16 +255,13 @@ impl ConnectionManager {
         map.remove(&room_id);
     }
 
-    // Start a 30-second grace period for a room after a user disconnects.
-    pub fn start_grace_period(&self, room_id: Uuid, offline_user_id: Uuid) {
+    // Keep the disconnect deadline aligned with the configured cleanup timer.
+    pub fn start_grace_period(&self, room_id: Uuid, offline_user_id: Uuid, grace_period: Duration) {
         let mut map = self
             .grace_periods
             .write()
             .expect("ConnectionManager grace_periods lock poisoned");
-        map.insert(
-            room_id,
-            (offline_user_id, Instant::now() + Duration::from_secs(30)),
-        );
+        map.insert(room_id, (offline_user_id, Instant::now() + grace_period));
     }
 
     // Check the current grace period for a room, if any.

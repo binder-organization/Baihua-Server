@@ -28,7 +28,12 @@ pub async fn initialize(
     ensure_app_directories(&app_directory).await?;
 
     // Load configuration.
-    let configuration = load_or_create_profile(&app_directory).await?;
+    let mut configuration = load_or_create_profile(&app_directory).await?;
+    if let Ok(grace_period) = std::env::var("BAIHUA_ENCRYPTED_GRACE_PERIOD_SECS") {
+        configuration.websocket.encrypted_grace_period_secs = grace_period
+            .parse()
+            .context("Invalid encrypted session grace period.")?;
+    }
     configuration.validate()?;
 
     let directory = Directory {

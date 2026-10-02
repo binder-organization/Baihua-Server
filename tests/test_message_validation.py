@@ -144,6 +144,7 @@ class TestMessageValidation:
 
     # ── cases ────────────────────────────────────────────────────────
 
+    @pytest.mark.smoke
     def test_valid_content_short(self, _setup_room) -> None:
         """Short valid message → message_sent ack."""
         ws, _token, _user, room_id = _setup_room

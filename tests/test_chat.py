@@ -93,6 +93,61 @@ def _recv_until(
 class ChatTest:
     """21 scenarios for the /api/v1/chat feature (HTTP + WebSocket)."""
 
+    @pytest.fixture(autouse=True)
+    def _prepare_shared_room(self, request, session: requests.Session, base_url: str):
+        room_scenarios = {
+            "test_s2_idempotent_create",
+            "test_s3_send_message",
+            "test_s4_get_messages_pagination",
+            "test_s6_not_room_member",
+            "test_s7_target_user_not_found",
+            "test_s8_list_rooms",
+            "test_s9_search_users",
+            "test_s17_websocket_rooms_listed_on_connect",
+            "test_s18_websocket_new_message_broadcast",
+            "test_s19_websocket_typing_indicator",
+            "test_s20_websocket_user_online_offline",
+            "test_s21_websocket_leave_stops_messages",
+        }
+        if request.node.name not in room_scenarios:
+            return
+
+        self.token_a, self.user_a = _register_and_login(
+            session, base_url, prefix="chatrooma"
+        )
+        self.token_b, self.user_b = _register_and_login(
+            session, base_url, prefix="chatroomb"
+        )
+        request_response = session.post(
+            f"{base_url}/api/v1/chat/rooms/requests",
+            json={
+                "receiver_id": self.user_b["id"],
+                "message": "hello",
+                "is_encrypted": False,
+            },
+            headers=self._auth(self.token_a),
+        )
+        assert request_response.status_code == 201, request_response.text
+        request_id = request_response.json()["data"]["request_id"]
+        accept_response = session.post(
+            f"{base_url}/api/v1/chat/rooms/requests/{request_id}/accept",
+            headers=self._auth(self.token_b),
+        )
+        assert accept_response.status_code == 200, accept_response.text
+        self.room_id = accept_response.json()["data"]["room"]["id"]
+
+        if request.node.name == "test_s4_get_messages_pagination":
+            socket = _ws_connect(base_url.replace("http", "ws"), self.token_a)
+            try:
+                _recv(socket)
+                socket.send(json.dumps({
+                    "type": "send_message",
+                    "data": {"room_id": self.room_id, "content": "hello"},
+                }))
+                _recv_until(socket, "message_sent")
+            finally:
+                socket.close()
+
     @staticmethod
     def _auth(token: str) -> dict:
         return {"Authorization": f"Bearer {token}"}
@@ -161,12 +216,6 @@ class ChatTest:
         assert user_a["id"] in members
         assert user_b["id"] in members
 
-        # persist for downstream tests
-        ChatTest.room_id = room_id
-        ChatTest.token_a = token_a
-        ChatTest.token_b = token_b
-        ChatTest.user_a = user_a
-        ChatTest.user_b = user_b
 
     # ── S2 ────────────────────────────────────────────────────────────
 
@@ -179,11 +228,11 @@ class ChatTest:
         same room id."""
         resp = session.post(
             f"{base_url}/api/v1/chat/rooms",
-            json={"username": ChatTest.user_b["username"]},
-            headers=self._auth(ChatTest.token_a),
+            json={"username": self.user_b["username"]},
+            headers=self._auth(self.token_a),
         )
         assert resp.status_code == 200, resp.text
-        assert resp.json()["data"]["id"] == ChatTest.room_id
+        assert resp.json()["data"]["id"] == self.room_id
 
     # ── S3 ────────────────────────────────────────────────────────────
 
@@ -194,23 +243,23 @@ class ChatTest:
 
         Expect message_sent ack, sender_id matches A, content matches, room_id matches."""
         ws_base = base_url.replace("http", "ws")
-        ws = _ws_connect(ws_base, ChatTest.token_a)
+        ws = _ws_connect(ws_base, self.token_a)
         try:
             _recv(ws)  # consume "connected"
             ws.send(
                 json.dumps({
                     "type": "send_message",
                     "data": {
-                        "room_id": ChatTest.room_id,
+                        "room_id": self.room_id,
                         "content": "hello",
                     },
                 })
             )
             msg = _recv_until(ws, "message_sent")
             data = msg["data"]
-            assert data["sender_id"] == ChatTest.user_a["id"]
+            assert data["sender_id"] == self.user_a["id"]
             assert data["content"] == "hello"
-            assert data["room_id"] == ChatTest.room_id
+            assert data["room_id"] == self.room_id
         finally:
             ws.close()
 
@@ -229,16 +278,15 @@ class ChatTest:
             has_more=False."""
         # send 2 additional messages so we have exactly 3 in the room
         ws_base = base_url.replace("http", "ws")
-        ws = _ws_connect(ws_base, ChatTest.token_a)
+        ws = _ws_connect(ws_base, self.token_a)
         try:
             _recv(ws)  # consume "connected"
             for content in ("world", "again"):
-                time.sleep(0.005)  # ensure distinct created_at timestamps
                 ws.send(
                     json.dumps({
                         "type": "send_message",
                         "data": {
-                            "room_id": ChatTest.room_id,
+                            "room_id": self.room_id,
                             "content": content,
                         },
                     })
@@ -249,9 +297,9 @@ class ChatTest:
 
         # page 1 ───────────────────────────────────────────────────────
         resp = session.get(
-            f"{base_url}/api/v1/chat/rooms/{ChatTest.room_id}/messages",
+            f"{base_url}/api/v1/chat/rooms/{self.room_id}/messages",
             params={"limit": 2},
-            headers=self._auth(ChatTest.token_a),
+            headers=self._auth(self.token_a),
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -271,9 +319,9 @@ class ChatTest:
 
         # page 2 ──────────────────────────────────────────────────────
         resp = session.get(
-            f"{base_url}/api/v1/chat/rooms/{ChatTest.room_id}/messages",
+            f"{base_url}/api/v1/chat/rooms/{self.room_id}/messages",
             params={"limit": 2, "before": next_cursor},
-            headers=self._auth(ChatTest.token_a),
+            headers=self._auth(self.token_a),
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -319,7 +367,7 @@ class ChatTest:
 
         # get messages as C
         resp = session.get(
-            f"{base_url}/api/v1/chat/rooms/{ChatTest.room_id}/messages",
+            f"{base_url}/api/v1/chat/rooms/{self.room_id}/messages",
             headers=self._auth(token_c),
         )
         assert resp.status_code == 403, resp.text
@@ -334,7 +382,7 @@ class ChatTest:
         resp = session.post(
             f"{base_url}/api/v1/chat/rooms",
             json={"username": "nonexistent_user_12345"},
-            headers=self._auth(ChatTest.token_a),
+            headers=self._auth(self.token_a),
         )
         assert resp.status_code == 404, resp.text
         assert resp.json()["code"] == "NOT_FOUND_ERROR"
@@ -349,7 +397,7 @@ class ChatTest:
         The room created in S1 must appear in the list."""
         resp = session.get(
             f"{base_url}/api/v1/chat/rooms",
-            headers=self._auth(ChatTest.token_a),
+            headers=self._auth(self.token_a),
         )
         assert resp.status_code == 200, resp.text
 
@@ -357,7 +405,7 @@ class ChatTest:
         rooms = body["data"]["rooms"]
         assert isinstance(rooms, list)
         room_ids = [r["id"] for r in rooms]
-        assert ChatTest.room_id in room_ids
+        assert self.room_id in room_ids
 
     # ── S9 ────────────────────────────────────────────────────────────
 
@@ -370,8 +418,8 @@ class ChatTest:
         phone number are private and must not be exposed."""
         resp = session.get(
             f"{base_url}/api/v1/user/search",
-            params={"username": ChatTest.user_b["username"]},
-            headers=self._auth(ChatTest.token_a),
+            params={"username": self.user_b["username"]},
+            headers=self._auth(self.token_a),
         )
         assert resp.status_code == 200, resp.text
 
@@ -526,11 +574,11 @@ class ChatTest:
     ) -> None:
         """S17 – User with rooms connects → `connected.rooms` lists them."""
         ws_base = base_url.replace("http", "ws")
-        ws = _ws_connect(ws_base, ChatTest.token_a)
+        ws = _ws_connect(ws_base, self.token_a)
         try:
             msg = _recv(ws)
             assert msg["type"] == "connected"
-            assert ChatTest.room_id in msg["data"]["rooms"]
+            assert self.room_id in msg["data"]["rooms"]
         finally:
             ws.close()
 
@@ -541,11 +589,11 @@ class ChatTest:
     ) -> None:
         """S18 – WS send_message → subscriber receives `new_message`."""
         ws_base = base_url.replace("http", "ws")
-        ws_b = _ws_connect(ws_base, ChatTest.token_b)
+        ws_b = _ws_connect(ws_base, self.token_b)
         try:
             _recv(ws_b)
 
-            ws_a = _ws_connect(ws_base, ChatTest.token_a)
+            ws_a = _ws_connect(ws_base, self.token_a)
             try:
                 _recv(ws_a)
 
@@ -553,7 +601,7 @@ class ChatTest:
                     json.dumps({
                         "type": "send_message",
                         "data": {
-                            "room_id": ChatTest.room_id,
+                            "room_id": self.room_id,
                             "content": "hello from S18",
                         },
                     })
@@ -564,8 +612,8 @@ class ChatTest:
 
                 # B receives broadcast
                 msg = _recv_until(ws_b, "new_message")
-                assert msg["data"]["room_id"] == ChatTest.room_id
-                assert msg["data"]["sender_id"] == ChatTest.user_a["id"]
+                assert msg["data"]["room_id"] == self.room_id
+                assert msg["data"]["sender_id"] == self.user_a["id"]
                 assert msg["data"]["content"] == "hello from S18"
             finally:
                 ws_a.close()
@@ -580,22 +628,22 @@ class ChatTest:
         """S19 – User sends `typing` → other room member receives indicator."""
         ws_base = base_url.replace("http", "ws")
 
-        ws_b = _ws_connect(ws_base, ChatTest.token_b)
+        ws_b = _ws_connect(ws_base, self.token_b)
         try:
             _recv(ws_b)
 
-            ws_a = _ws_connect(ws_base, ChatTest.token_a)
+            ws_a = _ws_connect(ws_base, self.token_a)
             try:
                 _recv(ws_a)
 
                 ws_a.send(
-                    json.dumps({"type": "typing", "room_id": ChatTest.room_id})
+                    json.dumps({"type": "typing", "room_id": self.room_id})
                 )
 
                 msg = _recv_until(ws_b, "typing")
-                assert msg["data"]["room_id"] == ChatTest.room_id
-                assert msg["data"]["user_id"] == ChatTest.user_a["id"]
-                assert msg["data"]["username"] == ChatTest.user_a["username"]
+                assert msg["data"]["room_id"] == self.room_id
+                assert msg["data"]["user_id"] == self.user_a["id"]
+                assert msg["data"]["username"] == self.user_a["username"]
                 assert msg["data"]["typing"] is True
             finally:
                 ws_a.close()
@@ -610,24 +658,23 @@ class ChatTest:
         """S20 – A connects → B sees `user_online`; A disconnects → B sees `user_offline`."""
         ws_base = base_url.replace("http", "ws")
 
-        ws_b = _ws_connect(ws_base, ChatTest.token_b)
+        ws_b = _ws_connect(ws_base, self.token_b)
         try:
             _recv(ws_b)
 
-            ws_a = _ws_connect(ws_base, ChatTest.token_a)
+            ws_a = _ws_connect(ws_base, self.token_a)
             try:
                 _recv(ws_a)
 
                 msg = _recv_until(ws_b, "user_online")
-                assert msg["data"]["user_id"] == ChatTest.user_a["id"]
-                assert msg["data"]["username"] == ChatTest.user_a["username"]
+                assert msg["data"]["user_id"] == self.user_a["id"]
+                assert msg["data"]["username"] == self.user_a["username"]
             finally:
                 ws_a.close()
-                time.sleep(0.3)
 
             msg = _recv_until(ws_b, "user_offline")
-            assert msg["data"]["user_id"] == ChatTest.user_a["id"]
-            assert msg["data"]["username"] == ChatTest.user_a["username"]
+            assert msg["data"]["user_id"] == self.user_a["id"]
+            assert msg["data"]["username"] == self.user_a["username"]
         finally:
             ws_b.close()
 
@@ -646,11 +693,11 @@ class ChatTest:
           5. A sends another msg → B must NOT receive it (cancel done).
         """
         ws_base = base_url.replace("http", "ws")
-        ws_b = _ws_connect(ws_base, ChatTest.token_b)
+        ws_b = _ws_connect(ws_base, self.token_b)
         try:
             _recv(ws_b)
 
-            ws_a = _ws_connect(ws_base, ChatTest.token_a)
+            ws_a = _ws_connect(ws_base, self.token_a)
             try:
                 _recv(ws_a)
 
@@ -659,7 +706,7 @@ class ChatTest:
                     json.dumps({
                         "type": "send_message",
                         "data": {
-                            "room_id": ChatTest.room_id,
+                            "room_id": self.room_id,
                             "content": "before leave",
                         },
                     })
@@ -670,18 +717,17 @@ class ChatTest:
                 # B leaves the room
                 resp = session.delete(
                     f"{base_url}/api/v1/chat/rooms/"
-                    f"{ChatTest.room_id}/members/{ChatTest.user_b['id']}",
-                    headers=self._auth(ChatTest.token_b),
+                    f"{self.room_id}/members/{self.user_b['id']}",
+                    headers=self._auth(self.token_b),
                 )
                 assert resp.status_code == 200, resp.text
-                time.sleep(0.5)  # allow tokio to cancel the forward task
 
                 # A sends another message
                 ws_a.send(
                     json.dumps({
                         "type": "send_message",
                         "data": {
-                            "room_id": ChatTest.room_id,
+                            "room_id": self.room_id,
                             "content": "after leave",
                         },
                     })
@@ -719,7 +765,7 @@ class ChatTest:
           4. A must NOT receive their own typing indicator.
 
         Note: uses a fresh room because S21 removed user_b from
-        ChatTest.room_id, so that room is no longer shared.
+        self.room_id, so that room is no longer shared.
         """
         # Register fresh users and create a new room for this test,
         # so we don't depend on state from earlier tests (S21 removes user_b).
