@@ -330,6 +330,15 @@ class ChatTest:
         assert len(data["messages"]) == 1
         assert data["has_more"] is False
 
+        for invalid_limit in (0, -1):
+            invalid_response = session.get(
+                f"{base_url}/api/v1/chat/rooms/{self.room_id}/messages",
+                params={"limit": invalid_limit},
+                headers=self._auth(self.token_a),
+            )
+            assert invalid_response.status_code == 400, invalid_response.text
+            assert invalid_response.json()["code"] == "VALIDATION_ERROR"
+
     # ── S5 ────────────────────────────────────────────────────────────
 
     def test_s5_unauthorized_access(
@@ -392,9 +401,19 @@ class ChatTest:
     def test_s8_list_rooms(
         self, session: requests.Session, base_url: str
     ) -> None:
-        """S8 – List rooms for authenticated user.
+        """S8 – Room pages include every room once and reject invalid bounds."""
+        create_response = session.post(
+            f"{base_url}/api/v1/chat/rooms",
+            json={
+                "is_group": True,
+                "name": "pagination-group",
+                "usernames": [self.user_b["username"]],
+            },
+            headers=self._auth(self.token_a),
+        )
+        assert create_response.status_code == 201, create_response.text
+        group_room_id = create_response.json()["data"]["id"]
 
-        The room created in S1 must appear in the list."""
         resp = session.get(
             f"{base_url}/api/v1/chat/rooms",
             headers=self._auth(self.token_a),
@@ -406,6 +425,34 @@ class ChatTest:
         assert isinstance(rooms, list)
         room_ids = [r["id"] for r in rooms]
         assert self.room_id in room_ids
+        assert group_room_id in room_ids
+
+        first_page = session.get(
+            f"{base_url}/api/v1/chat/rooms",
+            params={"limit": 1},
+            headers=self._auth(self.token_a),
+        )
+        second_page = session.get(
+            f"{base_url}/api/v1/chat/rooms",
+            params={"limit": 1, "offset": 1},
+            headers=self._auth(self.token_a),
+        )
+        assert first_page.status_code == 200, first_page.text
+        assert second_page.status_code == 200, second_page.text
+        first_data = first_page.json()["data"]
+        second_data = second_page.json()["data"]
+        assert first_data["has_more"] is True
+        assert second_data["has_more"] is False
+        assert [page["rooms"][0]["id"] for page in (first_data, second_data)] == room_ids
+
+        for invalid_parameters in ({"limit": 0}, {"limit": 101}, {"offset": -1}):
+            invalid_response = session.get(
+                f"{base_url}/api/v1/chat/rooms",
+                params=invalid_parameters,
+                headers=self._auth(self.token_a),
+            )
+            assert invalid_response.status_code == 400, invalid_response.text
+            assert invalid_response.json()["code"] == "VALIDATION_ERROR"
 
     # ── S9 ────────────────────────────────────────────────────────────
 
@@ -433,6 +480,14 @@ class ChatTest:
             assert "username" in user
             assert "email" not in user
             assert "phone_number" not in user
+
+        invalid_response = session.get(
+            f"{base_url}/api/v1/user/search",
+            params={"username": self.user_b["username"], "limit": 0},
+            headers=self._auth(self.token_a),
+        )
+        assert invalid_response.status_code == 400, invalid_response.text
+        assert invalid_response.json()["code"] == "VALIDATION_ERROR"
 
     # ── S10 ───────────────────────────────────────────────────────────
 

@@ -25,6 +25,13 @@ pub async fn get_messages(
     Path(room_id): Path<Uuid>,
     Query(params): Query<GetMessagesQuery>,
 ) -> Result<StandardResponse, ErrorResponse> {
+    let limit = params.limit.unwrap_or(50).min(100);
+    if limit < 1 {
+        return Err(ErrorResponse::Validation(
+            "Message page limit must be at least 1.".to_string(),
+        ));
+    }
+
     find_room_by_id(&state.pool, room_id).await?;
 
     if !is_room_member(&state.pool, room_id, auth_user.user_id).await? {
@@ -37,8 +44,6 @@ pub async fn get_messages(
         .bind(room_id)
         .fetch_one(&state.pool)
         .await?;
-
-    let limit = params.limit.unwrap_or(50).min(100);
 
     // Keyset pagination: use (created_at, id) composite to guarantee deterministic ordering
     // even when two messages share the same created_at timestamp.

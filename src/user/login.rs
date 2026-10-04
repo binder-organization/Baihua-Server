@@ -3,13 +3,12 @@ use crate::authenticate::jsonwebtoken::generate_token;
 use crate::common::StandardResponse;
 use crate::common::error::ErrorResponse;
 use crate::common::extractor::JsonBody;
-use crate::user::{UserLogin, find_user_with_password};
+use crate::user::{UserLogin, find_user_with_password, verify_password};
 use axum::extract::State;
 use axum::http::StatusCode;
-use bcrypt::verify;
 use serde_json::json;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::info;
 
 pub async fn login(
     State(state): State<Arc<ServerState>>,
@@ -23,10 +22,7 @@ pub async fn login(
         ));
     };
 
-    if !verify(&user_login.password, &password_hash).map_err(|error| {
-        error!("Password verification failed: {}", error);
-        ErrorResponse::InternalError("Failed to verify credentials.".to_string())
-    })? {
+    if !verify_password(user_login.password, password_hash).await? {
         return Err(ErrorResponse::Authentication(
             "Invalid username or password.".to_string(),
         ));

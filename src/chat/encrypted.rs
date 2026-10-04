@@ -49,6 +49,14 @@ pub(crate) async fn handle_encrypt_request(
         .await?
         .ok_or(ErrorResponse::NotFound("Room not found.".to_string()))?;
 
+    // Check room is not already in an active encrypted session.
+    if state.connection_manager.is_session_active(room_id) {
+        return Err(ErrorResponse::Conflict(
+            "Room already has an active encrypted session.".to_string(),
+        ));
+    }
+
+    // todo Add this feature to the group.
     if room.get("is_group") {
         return Err(ErrorResponse::BadRequest(
             "Encrypted chat is only supported in private rooms.".to_string(),
@@ -59,13 +67,6 @@ pub(crate) async fn handle_encrypt_request(
     if !crate::chat::is_room_member(&state.pool, room_id, user.id).await? {
         return Err(ErrorResponse::Forbidden(
             "You are not a member of this room.".to_string(),
-        ));
-    }
-
-    // Check room is not already in an active encrypted session.
-    if state.connection_manager.is_session_active(room_id) {
-        return Err(ErrorResponse::Conflict(
-            "Room already has an active encrypted session.".to_string(),
         ));
     }
 
@@ -158,7 +159,7 @@ pub(crate) async fn handle_encrypt_accept(
         ));
     }
 
-    // Clear pending state (accept is being processed).
+    // Clear pending state.
     state.connection_manager.clear_pending(room_id);
 
     // Forward acceptance to the room.
@@ -178,7 +179,7 @@ pub(crate) async fn handle_encrypt_accept(
     Ok(None)
 }
 
-// Phase 3: Each side confirms ready. Activate when both have signalled.
+// Phase 3: Each side confirms ready. Activate when both have signaled.
 pub(crate) async fn handle_encrypt_ready(
     state: &Arc<ServerState>,
     user: &User,

@@ -120,10 +120,7 @@ pub async fn auto_promote_admin(
 
     // Room does not exist.
     let Some(creator_option) = creator_id else {
-        warn!(
-            "Room {} does not exist, skipping admin promotion.",
-            room_id
-        );
+        warn!("Room {} does not exist, skipping admin promotion.", room_id);
         return Ok(());
     };
 
@@ -193,10 +190,7 @@ pub async fn auto_promote_admin(
             .await?;
     } else {
         // No members left — delete the room.
-        warn!(
-            "Room {} has no members left, deleting.",
-            room_id
-        );
+        warn!("Room {} has no members left, deleting.", room_id);
         sqlx::query("DELETE FROM rooms WHERE id = $1")
             .bind(room_id)
             .execute(pool)

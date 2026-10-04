@@ -37,6 +37,11 @@ pub async fn search_users(
 
     // Cap the page size at 50 rows per request.
     let limit = params.limit.unwrap_or(20).min(50);
+    if limit == 0 {
+        return Err(ErrorResponse::Validation(
+            "Search page limit must be at least 1.".to_string(),
+        ));
+    }
     let offset = params.offset.unwrap_or(0);
 
     let (rows, count) = match (&params.username, params.user_id) {

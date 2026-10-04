@@ -50,7 +50,7 @@ COPY --from=builder /app/migrations/ migrations/
 
 # Pre-create the app data directory. The server auto-generates a
 # production-ready config.toml on first startup via load_or_create_profile().
-RUN mkdir -p /app/.baihua/logs \
+RUN mkdir -p /app/.baihua/logs /app/.baihua/avatars \
     && chown -R baihua:baihua /app
 
 EXPOSE 2424

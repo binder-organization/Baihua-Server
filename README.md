@@ -68,36 +68,113 @@ Deploy the entire stack with Docker Compose:
 
 ```bash
 # 1. Prepare production environment variables
-# Start from the canonical example and fill in your production secrets:
-cp .env.example .env.production
-# Then edit .env.production with your production values (DB user/password, JWT secret, etc.)
+cp .env.production.example .env.production
+# Then edit .env.production with your production values.
 
 # 2. Build and start everything (first build may take 10-15 min)
 docker compose --env-file .env.production --profile production up -d --build
 ```
 
 > The first build downloads and compiles all Rust dependencies from scratch inside Docker.
-> Subsequent builds are much faster thanks to Docker's layer caching.
-> To watch build progress, use `docker compose --profile production up --build` (without `-d`).
+> Later build times depend on which build layers remain cached.
+> To watch build progress, use `docker compose --env-file .env.production --profile production up --build` (without `-d`).
+
+Before starting a public deployment, check these items:
+
+- Install Docker and Docker Compose on the deployment host.
+- Point the `BAIHUA_DOMAIN` address to the deployment host before starting the public profile.
+- Allow incoming traffic on ports 80 and 443 when the public profile is used.
+- Replace `POSTGRES_PASSWORD` and `JWT_SECRET` with strong random values.
+- Keep `.env.production` outside version control.
+- Back up the database and avatar volumes before upgrades.
 
 This starts two services:
 
 | Service | Container | Port |
 |---------|-----------|------|
-| **database** | `baihua-database` | 2423 (mapped) |
-| **server** | `baihua-server` | 2424 |
+| **database** | `baihua-database` | 2423 (localhost only) |
+| **server** | `baihua-server` | 2424 (localhost only) |
+
+Both ports are limited to the deployment host. The database is reachable from the server over the Compose network, so it does not need a public port. Uploaded avatars are stored in the `baihua-avatar-data` volume; database records are stored in `baihua-postgres-data`.
+
+To accept public traffic, set `BAIHUA_DOMAIN` in `.env.production` to a domain whose address points to this host, allow incoming connections on ports 80 and 443, and start the optional reverse proxy:
+
+```bash
+docker compose --env-file .env.production --profile production --profile public up -d --build
+```
+
+The reverse proxy manages encrypted certificates and forwards WebSocket connections. Its certificate state is stored in `baihua-caddy-data`; preserve this volume during updates. Without the public profile, the service remains available only on the deployment host.
+
+If you already use another reverse proxy, load balancer, or ingress controller, keep the public profile disabled. Start only the production profile and forward traffic from your existing proxy to `127.0.0.1:2424` on the deployment host. Make sure it forwards WebSocket upgrade requests to the same address.
 
 The server is gated by the database health check and includes a Docker HEALTHCHECK (`GET /health`). Logs:
 
 ```bash
-docker compose --profile production logs -f
+docker compose --env-file .env.production --profile production --profile public logs -f
 ```
 
-To stop and clean up:
+To stop the stack while keeping database records, uploaded avatars, and certificates:
 
 ```bash
-docker compose --profile production down -v
+docker compose --env-file .env.production --profile production --profile public down
 ```
+
+### Upgrade an existing deployment
+
+Back up production data first, then update the repository and rebuild the containers:
+
+```bash
+git pull
+docker compose --env-file .env.production --profile production --profile public up -d --build
+```
+
+The server runs database migrations during startup. After the upgrade, check service health and inspect recent logs:
+
+```bash
+curl -fsS http://127.0.0.1:2424/health
+docker compose --env-file .env.production --profile production --profile public logs --tail=100
+```
+
+If you do not use the public profile, omit `--profile public` from the upgrade and log commands.
+
+### Back up and restore production data
+
+Back up both the database and uploaded avatars during a maintenance window. Stop the server first so avatar files and database records stay in sync, then restart it after the backup commands, including when a backup command fails. The following commands create a separate, private directory for each backup; copy it to protected storage on another host and periodically test a full restore. Keep `.env.production` and any custom server configuration in protected storage as well.
+
+```bash
+umask 077
+backup_directory="backups/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$backup_directory"
+docker compose --env-file .env.production --profile production stop server
+docker compose --env-file .env.production exec -T database sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$backup_directory/database.dump"
+docker run --rm --mount type=volume,src=baihua-avatar-data,dst=/avatars,readonly --mount "type=bind,src=$PWD/$backup_directory,dst=/backups" alpine tar -C /avatars -cf /backups/avatars.tar .
+docker compose --env-file .env.production --profile production start server
+```
+
+If the public reverse proxy is enabled, also back up its certificate state into the same directory:
+
+```bash
+docker run --rm --mount type=volume,src=baihua-caddy-data,dst=/caddy-data,readonly --mount "type=bind,src=$PWD/$backup_directory,dst=/backups" alpine tar -C /caddy-data -cf /backups/caddy-data.tar .
+```
+
+Restore into a freshly provisioned stack with an empty database and empty data volumes. Select an existing backup directory, start only the database, then restore the database and avatars before starting the server:
+
+```bash
+backup_directory=backups/SELECTED_BACKUP_DIRECTORY
+docker compose --env-file .env.production up -d --wait database
+docker compose --env-file .env.production exec -T database sh -c 'pg_restore --exit-on-error --no-owner -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < "$backup_directory/database.dump"
+docker run --rm --mount type=volume,src=baihua-avatar-data,dst=/avatars --mount "type=bind,src=$PWD/$backup_directory,dst=/backups,readonly" alpine tar -C /avatars -xf /backups/avatars.tar
+docker compose --env-file .env.production --profile production up -d server
+```
+
+If the backup includes `caddy-data.tar`, restore it to the empty certificate volume and then start the public profile:
+
+```bash
+docker run --rm --mount type=volume,src=baihua-caddy-data,dst=/caddy-data --mount "type=bind,src=$PWD/$backup_directory,dst=/backups,readonly" alpine tar -C /caddy-data -xf /backups/caddy-data.tar
+docker compose --env-file .env.production --profile production --profile public up -d reverse-proxy
+```
+
+Check the server health, log in with an existing account, and retrieve an uploaded avatar after each restore rehearsal. Stop the server before restoring data into an existing deployment; do not overwrite a live database.
 
 ---
 
