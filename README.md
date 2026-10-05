@@ -86,7 +86,7 @@ Before starting a public deployment, check these items:
 - Allow incoming traffic on ports 80 and 443 when the public profile is used.
 - Replace `POSTGRES_PASSWORD` and `JWT_SECRET` with strong random values.
 - Keep `.env.production` outside version control.
-- Back up the database and avatar volumes before upgrades.
+- Back up the database, avatar, and file volumes before upgrades.
 
 This starts two services:
 
@@ -95,7 +95,7 @@ This starts two services:
 | **database** | `baihua-database` | 2423 (localhost only) |
 | **server** | `baihua-server` | 2424 (localhost only) |
 
-Both ports are limited to the deployment host. The database is reachable from the server over the Compose network, so it does not need a public port. Uploaded avatars are stored in the `baihua-avatar-data` volume; database records are stored in `baihua-postgres-data`.
+Both ports are limited to the deployment host. The database is reachable from the server over the Compose network, so it does not need a public port. Uploaded avatars are stored in the `baihua-avatar-data` volume; file message bytes are stored in `baihua-file-data`; database records are stored in `baihua-postgres-data`.
 
 To accept public traffic, set `BAIHUA_DOMAIN` in `.env.production` to a domain whose address points to this host, allow incoming connections on ports 80 and 443, and start the optional reverse proxy:
 
@@ -113,7 +113,7 @@ The server is gated by the database health check and includes a Docker HEALTHCHE
 docker compose --env-file .env.production --profile production --profile public logs -f
 ```
 
-To stop the stack while keeping database records, uploaded avatars, and certificates:
+To stop the stack while keeping database records, uploaded avatars, file message bytes, and certificates:
 
 ```bash
 docker compose --env-file .env.production --profile production --profile public down
@@ -139,7 +139,7 @@ If you do not use the public profile, omit `--profile public` from the upgrade a
 
 ### Back up and restore production data
 
-Back up both the database and uploaded avatars during a maintenance window. Stop the server first so avatar files and database records stay in sync, then restart it after the backup commands, including when a backup command fails. The following commands create a separate, private directory for each backup; copy it to protected storage on another host and periodically test a full restore. Keep `.env.production` and any custom server configuration in protected storage as well.
+Back up the database, uploaded avatars, and file message bytes during a maintenance window. Stop the server first so local files and database records stay in sync, then restart it after the backup commands, including when a backup command fails. The following commands create a separate, private directory for each backup; copy it to protected storage on another host and periodically test a full restore. Keep `.env.production` and any custom server configuration in protected storage as well.
 
 ```bash
 umask 077
@@ -148,6 +148,7 @@ mkdir -p "$backup_directory"
 docker compose --env-file .env.production --profile production stop server
 docker compose --env-file .env.production exec -T database sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$backup_directory/database.dump"
 docker run --rm --mount type=volume,src=baihua-avatar-data,dst=/avatars,readonly --mount "type=bind,src=$PWD/$backup_directory,dst=/backups" alpine tar -C /avatars -cf /backups/avatars.tar .
+docker run --rm --mount type=volume,src=baihua-file-data,dst=/files,readonly --mount "type=bind,src=$PWD/$backup_directory,dst=/backups" alpine tar -C /files -cf /backups/files.tar .
 docker compose --env-file .env.production --profile production start server
 ```
 
@@ -157,13 +158,14 @@ If the public reverse proxy is enabled, also back up its certificate state into 
 docker run --rm --mount type=volume,src=baihua-caddy-data,dst=/caddy-data,readonly --mount "type=bind,src=$PWD/$backup_directory,dst=/backups" alpine tar -C /caddy-data -cf /backups/caddy-data.tar .
 ```
 
-Restore into a freshly provisioned stack with an empty database and empty data volumes. Select an existing backup directory, start only the database, then restore the database and avatars before starting the server:
+Restore into a freshly provisioned stack with an empty database and empty data volumes. Select an existing backup directory, start only the database, then restore the database, avatars, and file message bytes before starting the server:
 
 ```bash
 backup_directory=backups/SELECTED_BACKUP_DIRECTORY
 docker compose --env-file .env.production up -d --wait database
 docker compose --env-file .env.production exec -T database sh -c 'pg_restore --exit-on-error --no-owner -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < "$backup_directory/database.dump"
 docker run --rm --mount type=volume,src=baihua-avatar-data,dst=/avatars --mount "type=bind,src=$PWD/$backup_directory,dst=/backups,readonly" alpine tar -C /avatars -xf /backups/avatars.tar
+docker run --rm --mount type=volume,src=baihua-file-data,dst=/files --mount "type=bind,src=$PWD/$backup_directory,dst=/backups,readonly" alpine tar -C /files -xf /backups/files.tar
 docker compose --env-file .env.production --profile production up -d server
 ```
 
@@ -174,7 +176,7 @@ docker run --rm --mount type=volume,src=baihua-caddy-data,dst=/caddy-data --moun
 docker compose --env-file .env.production --profile production --profile public up -d reverse-proxy
 ```
 
-Check the server health, log in with an existing account, and retrieve an uploaded avatar after each restore rehearsal. Stop the server before restoring data into an existing deployment; do not overwrite a live database.
+Check the server health, log in with an existing account, retrieve an uploaded avatar, and download a file message after each restore rehearsal. Stop the server before restoring data into an existing deployment; do not overwrite a live database.
 
 ---
 

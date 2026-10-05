@@ -1,4 +1,5 @@
 pub(crate) mod encrypted;
+pub(crate) mod file;
 mod member;
 mod message;
 mod request;
@@ -107,10 +108,11 @@ pub async fn get_member_count(pool: &PgPool, room_id: Uuid) -> Result<i64, Error
 // 3. The oldest remaining member by joined_at (no exclusion — last-resort fallback).
 // If the room has no members left, it is deleted.
 pub async fn auto_promote_admin(
-    pool: &PgPool,
+    state: &ServerState,
     room_id: Uuid,
     excluding_user_id: Uuid,
 ) -> Result<(), ErrorResponse> {
+    let pool = &state.pool;
     // Look up the room's creator (NULL once the creator deleted the account).
     let creator_id =
         sqlx::query_scalar::<_, Option<Uuid>>("SELECT created_by FROM rooms WHERE id = $1")
@@ -191,10 +193,7 @@ pub async fn auto_promote_admin(
     } else {
         // No members left — delete the room.
         warn!("Room {} has no members left, deleting.", room_id);
-        sqlx::query("DELETE FROM rooms WHERE id = $1")
-            .bind(room_id)
-            .execute(pool)
-            .await?;
+        file::delete_room_with_files(state, room_id).await?;
     }
 
     Ok(())
@@ -234,6 +233,14 @@ pub fn router(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
             axum::routing::delete(member::remove_member),
         )
         .route("/rooms/{room_id}/messages", get(message::get_messages))
+        .route(
+            "/rooms/{room_id}/files",
+            post(file::upload_file).layer(file::upload_body_limit_layer(&state)),
+        )
+        .route(
+            "/rooms/{room_id}/files/{message_id}",
+            get(file::download_file),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state,
             crate::middleware::authenticate::authenticate,

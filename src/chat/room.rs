@@ -462,9 +462,10 @@ pub async fn list_rooms(
              SELECT COUNT(*) AS cnt FROM room_members WHERE room_id = r.id \
          ) mc ON true \
          LEFT JOIN LATERAL ( \
-             SELECT m.id AS msg_id, m.content, m.created_at, u.username AS sender_username \
+             SELECT m.id AS msg_id, COALESCE(m.content, 'File: ' || f.original_name) AS content, m.created_at, u.username AS sender_username \
              FROM messages m \
              LEFT JOIN users u ON m.sender_id = u.id \
+             LEFT JOIN file_attachments f ON f.message_id = m.id \
              WHERE m.room_id = r.id \
              ORDER BY m.created_at DESC, m.id DESC \
              LIMIT 1 \

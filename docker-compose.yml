@@ -26,6 +26,7 @@ services:
       - "127.0.0.1:2424:2424"
     volumes:
       - avatars:/app/.baihua/avatars
+      - files:/app/.baihua/files
     environment:
       BAIHUA_ENV: production
       BAIHUA_DIR: /app/.baihua
@@ -64,6 +65,8 @@ volumes:
     name: baihua-postgres-data
   avatars:
     name: baihua-avatar-data
+  files:
+    name: baihua-file-data
   caddy_data:
     name: baihua-caddy-data
   caddy_config:

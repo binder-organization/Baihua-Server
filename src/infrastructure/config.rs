@@ -15,6 +15,8 @@ pub struct ServerConfiguration {
     pub room_request: RoomRequestConfiguration,
     #[serde(default)]
     pub avatar: AvatarConfiguration,
+    #[serde(default)]
+    pub file: FileConfiguration,
 }
 
 // Web server configuration
@@ -87,6 +89,34 @@ impl Default for RateLimitConfiguration {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::ServerConfiguration;
+
+    #[test]
+    fn default_file_configuration_uses_five_gib_without_rate_limit() {
+        let configuration = ServerConfiguration::default();
+
+        assert_eq!(configuration.file.max_bytes, 5 * 1024 * 1024 * 1024);
+        assert!(!configuration.file.transfer_rate_limit_enabled);
+        assert_eq!(configuration.file.upload_mibps, 0);
+        assert_eq!(configuration.file.download_mibps, 0);
+    }
+
+    #[test]
+    fn enabled_file_rate_limit_requires_upload_and_download_rates() {
+        let mut configuration = ServerConfiguration::default();
+        configuration.file.transfer_rate_limit_enabled = true;
+        configuration.file.upload_mibps = 1;
+        configuration.file.download_mibps = 0;
+
+        assert!(configuration.validate().is_err());
+
+        configuration.file.download_mibps = 1;
+        assert!(configuration.validate().is_ok());
+    }
+}
+
 // WebSocket configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSocketConfiguration {
@@ -152,6 +182,30 @@ impl Default for AvatarConfiguration {
     fn default() -> Self {
         Self {
             max_bytes: default_avatar_max_bytes(),
+        }
+    }
+}
+
+// File message configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileConfiguration {
+    #[serde(default = "default_file_max_bytes")]
+    pub max_bytes: u64,
+    #[serde(default)]
+    pub transfer_rate_limit_enabled: bool,
+    #[serde(default)]
+    pub upload_mibps: u32,
+    #[serde(default)]
+    pub download_mibps: u32,
+}
+
+impl Default for FileConfiguration {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_file_max_bytes(),
+            transfer_rate_limit_enabled: false,
+            upload_mibps: 0,
+            download_mibps: 0,
         }
     }
 }
@@ -232,6 +286,9 @@ fn default_room_request_send_daily_limit() -> u32 {
 fn default_avatar_max_bytes() -> u32 {
     2 * 1024 * 1024 // 2 MB
 }
+fn default_file_max_bytes() -> u64 {
+    5 * 1024 * 1024 * 1024 // 5 GB
+}
 
 impl Default for ServerConfiguration {
     fn default() -> Self {
@@ -263,6 +320,7 @@ impl Default for ServerConfiguration {
             avatar: AvatarConfiguration {
                 max_bytes: default_avatar_max_bytes(),
             },
+            file: FileConfiguration::default(),
         }
     }
 }
@@ -450,6 +508,25 @@ send_daily_limit = 20
 #
 # Uploads exceeding this size are rejected with a 413 Payload Too Large.
 max_bytes = 2097152
+
+# ---- Files ----
+
+[file]
+# The maximum size of a file message in bytes.
+# When omitted, defaults to 5368709120 (5 GB).
+max_bytes = 5368709120
+
+# Whether file upload and download speed limits are enabled.
+# When omitted, defaults to false.
+transfer_rate_limit_enabled = false
+
+# Upload speed limit in mebibits per second.
+# Ignored when transfer_rate_limit_enabled is false.
+upload_mibps = 0
+
+# Download speed limit in mebibits per second.
+# Ignored when transfer_rate_limit_enabled is false.
+download_mibps = 0
 "#
         .to_string()
     }
@@ -541,6 +618,16 @@ max_bytes = 2097152
 
         if self.avatar.max_bytes == 0 {
             bail!("The avatar max bytes cannot be 0.");
+        }
+        if self.file.max_bytes == 0 {
+            bail!("The file max bytes cannot be 0.");
+        }
+        if self.file.transfer_rate_limit_enabled
+            && (self.file.upload_mibps == 0 || self.file.download_mibps == 0)
+        {
+            bail!(
+                "The file upload and download limits cannot be 0 when file transfer rate limiting is enabled."
+            );
         }
 
         Ok(())

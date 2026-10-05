@@ -95,10 +95,17 @@ pub async fn initialize(
         environment,
         connection_manager: Arc::new(ConnectionManager::new()),
         avatars_directory: app_directory.join("avatars"),
+        files_directory: app_directory.join("files"),
+        file_uploads_directory: app_directory.join("file_uploads"),
+        file_operations: Arc::new(tokio::sync::Mutex::new(())),
         login_rate_limiter,
         register_rate_limiter,
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
+
+    crate::chat::file::cleanup_pending_files(&state)
+        .await
+        .context("Failed to clean pending stored files.")?;
 
     info!("Initialization completed.");
 
@@ -106,7 +113,7 @@ pub async fn initialize(
 }
 
 async fn ensure_app_directories(app_directory: &Path) -> Result<()> {
-    let directories = vec!["logs", "avatars"];
+    let directories = vec!["logs", "avatars", "files", "file_uploads"];
 
     for directory_name in directories {
         let directory_path = app_directory.join(directory_name);
