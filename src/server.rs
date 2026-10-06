@@ -8,6 +8,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::get;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tracing::info;
 
 pub async fn server(
@@ -73,6 +74,10 @@ pub async fn server(
                 match reason {
                     Some(CommandType::Shutdown) => {
                         info!("Received shutdown command from console.");
+                    }
+                    Some(CommandType::Restart) => {
+                        state.restart_requested.store(true, Ordering::SeqCst);
+                        info!("Received restart command from console.");
                     }
                     None => {
                         info!("Command channel closed.");

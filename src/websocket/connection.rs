@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 type RoomSubKey = (Uuid, Uuid);
@@ -72,9 +72,8 @@ impl ConnectionManager {
                 Ok(n) => {
                     trace!("broadcast to {n} receiver(s) in room {room_id}");
                 }
-                Err(_) => {
-                    warn!("broadcast to room {room_id} failed: send error");
-                }
+                // No active receivers is normal while clients disconnect or reconnect.
+                Err(_) => {}
             }
         }
     }
@@ -168,6 +167,38 @@ impl ConnectionManager {
             .read()
             .expect("ConnectionManager user_connections lock poisoned")
             .contains_key(&user_id)
+    }
+
+    // Number of users with at least one active connection.
+    pub fn online_user_count(&self) -> usize {
+        self.user_connections
+            .read()
+            .expect("ConnectionManager user_connections lock poisoned")
+            .len()
+    }
+
+    // Total number of active connections across every online user.
+    pub fn total_connection_count(&self) -> usize {
+        self.user_connections
+            .read()
+            .expect("ConnectionManager user_connections lock poisoned")
+            .values()
+            .sum()
+    }
+
+    // Number of subscriber connections per room, for rooms with at least one
+    // subscriber. A user with several connections in one room counts once per
+    // connection because each connection receives its own copy.
+    pub fn room_subscription_counts(&self) -> Vec<(Uuid, usize)> {
+        let subs = self
+            .subs
+            .read()
+            .expect("ConnectionManager subs lock poisoned");
+        let mut counts: HashMap<Uuid, usize> = HashMap::new();
+        for ((_, room_id), senders) in subs.iter() {
+            *counts.entry(*room_id).or_default() += senders.len();
+        }
+        counts.into_iter().collect()
     }
 
     // ── Encrypted session helpers ─────────────────────────────────
@@ -298,6 +329,27 @@ impl ConnectionManager {
             .read()
             .expect("ConnectionManager active_sessions lock poisoned");
         map.keys().copied().collect()
+    }
+
+    // Return all room IDs waiting for an encrypted chat request to be accepted.
+    pub fn pending_session_rooms(&self) -> Vec<Uuid> {
+        let map = self
+            .pending_states
+            .read()
+            .expect("ConnectionManager pending_states lock poisoned");
+        map.iter().copied().collect()
+    }
+
+    // Return every room inside the reconnect grace period together with the
+    // offline user and the moment the grace period ends.
+    pub fn grace_period_rooms(&self) -> Vec<(Uuid, Uuid, Instant)> {
+        let map = self
+            .grace_periods
+            .read()
+            .expect("ConnectionManager grace_periods lock poisoned");
+        map.iter()
+            .map(|(room_id, (offline_user_id, deadline))| (*room_id, *offline_user_id, *deadline))
+            .collect()
     }
 
     // Signal every live connection to close so graceful shutdown does not

@@ -3,7 +3,7 @@ use crate::ServerState;
 use crate::infrastructure::config::ServerConfiguration;
 use crate::infrastructure::database::get_pool;
 use crate::infrastructure::environment::Environment;
-use crate::infrastructure::log;
+use crate::infrastructure::log::{self, LogSystem};
 use crate::middleware::rate_limit::SlidingWindowRateLimiter;
 use crate::websocket::connection::ConnectionManager;
 use anyhow::{Context, Result, anyhow};
@@ -14,9 +14,7 @@ use std::sync::Arc;
 use tokio::fs;
 use tracing::info;
 
-pub async fn initialize(
-    environment: Environment,
-) -> Result<(ServerState, tracing_appender::non_blocking::WorkerGuard)> {
+pub async fn initialize(environment: Environment) -> Result<(ServerState, LogSystem)> {
     println!("Initialize: Start initializing the server.");
 
     // Determine the application directory.
@@ -56,7 +54,7 @@ pub async fn initialize(
         log: app_directory.join("logs"),
     };
 
-    let guard = log::init_log(&directory, &configuration, environment)
+    let log_system = log::init_log(&directory, &configuration, environment)
         .map_err(|error| anyhow!("Failed to initialize logging system: {}.", error))?;
 
     let pool = get_pool(environment, &configuration.database).await?;
@@ -116,6 +114,8 @@ pub async fn initialize(
         login_rate_limiter,
         register_rate_limiter,
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        restart_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        started_at: std::time::Instant::now(),
     };
 
     crate::chat::file::cleanup_pending_files(&state)
@@ -124,7 +124,7 @@ pub async fn initialize(
 
     info!("Initialization completed.");
 
-    Ok((state, guard))
+    Ok((state, log_system))
 }
 
 async fn ensure_app_directories(app_directory: &Path) -> Result<()> {

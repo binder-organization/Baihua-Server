@@ -7,13 +7,27 @@ use tracing_subscriber::{
     EnvFilter, Registry,
     fmt::{self, format::FmtSpan},
     layer::SubscriberExt,
+    reload,
 };
+
+// Runtime handle that replaces the global log filter. The same filter governs
+// both the terminal and the file layer, so one reload updates both outputs.
+pub type LogFilterHandle = reload::Handle<EnvFilter, Registry>;
+
+// Keeps the log system alive after initialization and carries the handle used
+// to change the filter while the server is running.
+pub struct LogSystem {
+    // Dropping the guard flushes every buffered log record to disk.
+    pub guard: tracing_appender::non_blocking::WorkerGuard,
+    // Consumed by the development console so `log level` can reload the filter.
+    pub filter_handle: LogFilterHandle,
+}
 
 pub fn init_log(
     directory: &Directory,
     configuration: &ServerConfiguration,
     env: Environment,
-) -> Result<tracing_appender::non_blocking::WorkerGuard, Box<dyn std::error::Error>> {
+) -> Result<LogSystem, Box<dyn std::error::Error>> {
     let logs_dir = directory.log.clone();
     let config = &configuration.logs;
 
@@ -32,6 +46,9 @@ pub fn init_log(
     if env.is_development() {
         let filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
+        // Wrapping the filter keeps it reloadable while the subscriber itself
+        // stays installed for the whole process lifetime.
+        let (filter_layer, filter_handle) = reload::Layer::new(filter);
 
         let file = fmt::layer()
             .json()
@@ -49,17 +66,24 @@ pub fn init_log(
             .with_thread_ids(false)
             .with_thread_names(true);
 
-        let subscriber = Registry::default().with(filter).with(stdout).with(file);
+        let subscriber = Registry::default()
+            .with(filter_layer)
+            .with(stdout)
+            .with(file);
 
         set_global_default(subscriber)?;
 
         tracing::info!("Log system initialization complete.");
 
-        return Ok(guard);
+        return Ok(LogSystem {
+            guard,
+            filter_handle,
+        });
     }
 
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
+    let (filter_layer, filter_handle) = reload::Layer::new(filter);
 
     let file = fmt::layer()
         .json()
@@ -76,11 +100,17 @@ pub fn init_log(
         .with_target(true)
         .with_thread_ids(true);
 
-    let subscriber = Registry::default().with(filter).with(stdout).with(file);
+    let subscriber = Registry::default()
+        .with(filter_layer)
+        .with(stdout)
+        .with(file);
 
     set_global_default(subscriber)?;
 
     tracing::info!("Log system initialization complete.");
 
-    Ok(guard)
+    Ok(LogSystem {
+        guard,
+        filter_handle,
+    })
 }

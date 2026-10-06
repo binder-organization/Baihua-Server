@@ -45,6 +45,11 @@ pub struct ServerState {
     pub(crate) login_rate_limiter: Arc<SlidingWindowRateLimiter>,
     pub(crate) register_rate_limiter: Arc<SlidingWindowRateLimiter>,
     pub(crate) shutting_down: Arc<AtomicBool>,
+    // Set when the console requests a restart; main re-executes the binary
+    // once the graceful shutdown and the log flush have completed.
+    pub(crate) restart_requested: Arc<AtomicBool>,
+    // Captured during initialization so the console can report uptime.
+    pub(crate) started_at: std::time::Instant,
 }
 
 #[tokio::main]
@@ -71,8 +76,8 @@ async fn main() -> Result<()> {
     println!("No more war, Peace is our dream.");
 
     // Initialize the server.
-    let (state, log_guard) = match initialize::initialize(environment).await {
-        Ok((server_state, guard)) => (server_state, guard),
+    let (state, log_system) = match initialize::initialize(environment).await {
+        Ok((server_state, log_system)) => (server_state, log_system),
         Err(error) => {
             eprintln!(
                 "\x1b[31mInitialize Error:\x1b[0m Server initialization failed: {}",
@@ -81,6 +86,11 @@ async fn main() -> Result<()> {
             return Err(error);
         }
     };
+
+    let infrastructure::log::LogSystem {
+        guard: log_guard,
+        filter_handle,
+    } = log_system;
 
     info!(
         "Server address: {}:{}.",
@@ -92,7 +102,7 @@ async fn main() -> Result<()> {
 
     let mut server_handle = if state.environment.is_development() {
         let (command_tx, command_rx) = tokio::sync::mpsc::channel::<console::CommandType>(32);
-        tokio::spawn(console::console(command_tx));
+        tokio::spawn(console::console(command_tx, state.clone(), filter_handle));
         tokio::spawn(server::server(Some(command_rx), shutdown_rx, state.clone()))
     } else {
         tokio::spawn(server::server(None, shutdown_rx, state.clone()))
@@ -131,6 +141,13 @@ async fn main() -> Result<()> {
     drop(log_guard);
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
+    // The replacement process reads the configuration from disk again, so the
+    // restart must wait for the graceful shutdown and the log flush.
+    if exit_code == 0 && state.restart_requested.load(Ordering::SeqCst) {
+        println!("Restarting Baihua Server.");
+        restart_process();
+    }
+
     println!("Goodbye!");
 
     if exit_code != 0 {
@@ -138,6 +155,47 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// Replaces the current process with a fresh copy of the same executable,
+// forwarding every command line argument.
+fn restart_process() {
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            eprintln!("Restart failed: cannot determine the executable path: {error}.");
+            std::process::exit(1);
+        }
+    };
+    let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec only returns when it fails to replace the process image.
+        let error = std::process::Command::new(executable)
+            .args(arguments)
+            .exec();
+        eprintln!("Restart failed: {error}.");
+        std::process::exit(1);
+    }
+
+    // Windows has no exec, so start a child process and leave. The listener
+    // already closed during the graceful shutdown, and this process exits
+    // immediately, so the child can bind the port.
+    #[cfg(not(unix))]
+    {
+        match std::process::Command::new(executable)
+            .args(arguments)
+            .spawn()
+        {
+            Ok(_) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("Restart failed: {error}.");
+                std::process::exit(1);
+            }
+        }
+    }
 }
 
 // Waits for either SIGINT or SIGTERM (UNIX) or Ctrl-C (Windows).

@@ -36,21 +36,11 @@ pub async fn login(
     )
     .await?;
 
-    if state.environment.is_production() {
-        // Production environments should not expose JWT tokens.
-        info!(
-            "User logged in: {}, id: {}.",
-            user_login.username,
-            user.id.to_string()
-        );
-    } else if state.environment.is_development() {
-        info!(
-            "User logged in: {}, id: {}, token: {}.",
-            user_login.username,
-            user.id.to_string(),
-            token
-        );
-    }
+    info!(
+        "User logged in: {}, id: {}.",
+        user_login.username,
+        user.id.to_string()
+    );
 
     Ok(StandardResponse::success(
         StatusCode::OK,

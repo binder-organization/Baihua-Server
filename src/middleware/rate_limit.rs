@@ -63,6 +63,49 @@ impl SlidingWindowRateLimiter {
         entries.push(now);
         true
     }
+
+    // Maximum number of requests one address may send per window.
+    pub(crate) fn max_requests(&self) -> u32 {
+        self.max_requests
+    }
+
+    // Length of the sliding window in seconds.
+    pub(crate) fn window_secs(&self) -> u64 {
+        self.window_secs
+    }
+
+    // Returns every tracked address with the number of requests still counted
+    // inside the current window, ordered from most to least used.
+    pub(crate) async fn snapshot(&self) -> Vec<(IpAddr, usize)> {
+        let state = self.inner.read().await;
+        let now = Instant::now();
+        let window = std::time::Duration::from_secs(self.window_secs);
+        let mut records: Vec<(IpAddr, usize)> = state
+            .entries
+            .iter()
+            .filter_map(|(ip, timestamps)| {
+                let used = timestamps
+                    .iter()
+                    .filter(|timestamp| now.duration_since(**timestamp) < window)
+                    .count();
+                (used > 0).then_some((*ip, used))
+            })
+            .collect();
+        records.sort_by_key(|(ip, used)| (std::cmp::Reverse(*used), *ip));
+        records
+    }
+
+    // Drops the recorded requests for one address, or for every address when
+    // no address is given.
+    pub(crate) async fn clear(&self, ip: Option<IpAddr>) {
+        let mut state = self.inner.write().await;
+        match ip {
+            Some(ip) => {
+                state.entries.remove(&ip);
+            }
+            None => state.entries.clear(),
+        }
+    }
 }
 
 fn extract_client_ip(request: &Request) -> Option<IpAddr> {
@@ -118,4 +161,49 @@ pub async fn rate_limit_register(
     }
 
     next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SlidingWindowRateLimiter;
+    use std::net::IpAddr;
+
+    #[tokio::test]
+    async fn snapshot_counts_the_requests_inside_the_window() {
+        let limiter = SlidingWindowRateLimiter::new(3, 60);
+        let first_address: IpAddr = "192.0.2.1"
+            .parse()
+            .expect("The literal address must parse.");
+        let second_address: IpAddr = "192.0.2.2"
+            .parse()
+            .expect("The literal address must parse.");
+
+        assert!(limiter.allow(first_address).await);
+        assert!(limiter.allow(first_address).await);
+        assert!(limiter.allow(second_address).await);
+
+        assert_eq!(
+            limiter.snapshot().await,
+            vec![(first_address, 2), (second_address, 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_removes_one_address_and_keeps_the_others() {
+        let limiter = SlidingWindowRateLimiter::new(3, 60);
+        let blocked_address: IpAddr = "192.0.2.1"
+            .parse()
+            .expect("The literal address must parse.");
+        let other_address: IpAddr = "192.0.2.2"
+            .parse()
+            .expect("The literal address must parse.");
+        limiter.allow(blocked_address).await;
+        limiter.allow(other_address).await;
+
+        limiter.clear(Some(blocked_address)).await;
+        assert_eq!(limiter.snapshot().await, vec![(other_address, 1)]);
+
+        limiter.clear(None).await;
+        assert!(limiter.snapshot().await.is_empty());
+    }
 }

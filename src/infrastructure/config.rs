@@ -350,8 +350,8 @@ impl Default for ServerConfiguration {
 }
 
 impl ServerConfiguration {
-    /// Returns the default configuration as a TOML string with detailed
-    /// comments describing each field and its possible values.
+    // Returns the default configuration as a TOML string with detailed
+    // comments describing each field and its possible values.
     pub fn default_config_content() -> String {
         r#"# ---- Web Server ----
 
