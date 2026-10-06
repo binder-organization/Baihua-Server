@@ -39,7 +39,7 @@ RUN groupadd -r baihua && useradd -r -g baihua -d /app -s /sbin/nologin baihua
 #   ca-certificates — TLS verification for outbound HTTPS (GitHub API, etc.)
 #   curl            — HEALTHCHECK probe
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Binary
@@ -47,6 +47,7 @@ COPY --from=builder /app/target/release/baihua-server .
 # SQL migrations — loaded at startup by sqlx::migrate::Migrator
 # (looks for ./migrations/ relative to the binary in production mode)
 COPY --from=builder /app/migrations/ migrations/
+COPY --chmod=755 deploy/entrypoint.sh /usr/local/bin/baihua-entrypoint
 
 # Pre-create the app data directory. The server auto-generates a
 # production-ready config.toml on first startup via load_or_create_profile().
@@ -66,9 +67,6 @@ EXPOSE 2424
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:2424/health
 
-# Drop privileges before starting the server
-USER baihua
-
 # ---------------------------------------------------------------------------
 # REQUIRED RUNTIME ENVIRONMENT VARIABLES
 # None of these are set in the image — they MUST be provided at runtime:
@@ -83,4 +81,5 @@ USER baihua
 #
 # See .env.example for defaults and docker-compose.yml for production setup.
 # ---------------------------------------------------------------------------
+ENTRYPOINT ["baihua-entrypoint"]
 CMD ["./baihua-server"]

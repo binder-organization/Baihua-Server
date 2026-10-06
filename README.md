@@ -62,6 +62,8 @@ To run the full test suite (build + DB + server + pytest):
 python3 tests/run_tests.py
 ```
 
+Use `python3 tests/run_tests.py --docker` to run the server inside a container. On macOS with Colima, the runner places its temporary file directory under your home directory so Docker can access the bind mount. If you run the container manually with another bind mount, use a host directory shared with the Colima virtual machine and writable by the `baihua` user.
+
 ### Production
 
 Deploy the entire stack with Docker Compose:
@@ -96,6 +98,12 @@ This starts two services:
 | **server** | `baihua-server` | 2424 (localhost only) |
 
 Both ports are limited to the deployment host. The database is reachable from the server over the Compose network, so it does not need a public port. Uploaded avatars are stored in the `baihua-avatar-data` volume; file message bytes are stored in `baihua-file-data`; database records are stored in `baihua-postgres-data`.
+
+Run one server instance for each database and local file volume. File storage, active upload tracking, encrypted session state, and WebSocket connections are local to the server process. Multiple server instances require shared file storage and distributed coordination, which this version does not provide.
+
+File uploads default to a 5 gibibyte limit, a 50 gibibyte logical quota for each user, at most two concurrent uploads for each user, and a 30 second wait for the next upload chunk. Configure these values with `file.max_bytes`, `file.per_user_quota_bytes`, `file.maximum_concurrent_uploads_per_user`, and `file.upload_idle_timeout_secs` in `config.toml`. File upload requests are exempt from the ordinary request timeout; the upload idle timeout resets when another multipart chunk arrives.
+
+The container entrypoint starts as root to prepare application directories, then runs the server as the `baihua` user. If a bind mount rejects ownership changes, startup continues only when that user can write to the mounted directory.
 
 To accept public traffic, set `BAIHUA_DOMAIN` in `.env.production` to a domain whose address points to this host, allow incoming connections on ports 80 and 443, and start the optional reverse proxy:
 

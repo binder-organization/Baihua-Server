@@ -16,9 +16,6 @@ CREATE TABLE file_attachments (
 
 CREATE INDEX file_attachments_content_hash_index ON file_attachments (content_hash);
 
-CREATE INDEX stored_files_unreferenced_index
-    ON stored_files (content_hash) WHERE reference_count = 0;
-
 CREATE FUNCTION update_stored_file_reference_count()
 RETURNS TRIGGER AS $$
 BEGIN

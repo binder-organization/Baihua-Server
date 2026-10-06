@@ -98,6 +98,12 @@ mod tests {
         let configuration = ServerConfiguration::default();
 
         assert_eq!(configuration.file.max_bytes, 5 * 1024 * 1024 * 1024);
+        assert_eq!(
+            configuration.file.per_user_quota_bytes,
+            50 * 1024 * 1024 * 1024
+        );
+        assert_eq!(configuration.file.maximum_concurrent_uploads_per_user, 2);
+        assert_eq!(configuration.file.upload_idle_timeout_secs, 30);
         assert!(!configuration.file.transfer_rate_limit_enabled);
         assert_eq!(configuration.file.upload_mibps, 0);
         assert_eq!(configuration.file.download_mibps, 0);
@@ -191,6 +197,12 @@ impl Default for AvatarConfiguration {
 pub struct FileConfiguration {
     #[serde(default = "default_file_max_bytes")]
     pub max_bytes: u64,
+    #[serde(default = "default_file_per_user_quota_bytes")]
+    pub per_user_quota_bytes: u64,
+    #[serde(default = "default_maximum_concurrent_uploads_per_user")]
+    pub maximum_concurrent_uploads_per_user: u32,
+    #[serde(default = "default_upload_idle_timeout_secs")]
+    pub upload_idle_timeout_secs: u64,
     #[serde(default)]
     pub transfer_rate_limit_enabled: bool,
     #[serde(default)]
@@ -203,6 +215,9 @@ impl Default for FileConfiguration {
     fn default() -> Self {
         Self {
             max_bytes: default_file_max_bytes(),
+            per_user_quota_bytes: default_file_per_user_quota_bytes(),
+            maximum_concurrent_uploads_per_user: default_maximum_concurrent_uploads_per_user(),
+            upload_idle_timeout_secs: default_upload_idle_timeout_secs(),
             transfer_rate_limit_enabled: false,
             upload_mibps: 0,
             download_mibps: 0,
@@ -288,6 +303,15 @@ fn default_avatar_max_bytes() -> u32 {
 }
 fn default_file_max_bytes() -> u64 {
     5 * 1024 * 1024 * 1024 // 5 GB
+}
+fn default_file_per_user_quota_bytes() -> u64 {
+    50 * 1024 * 1024 * 1024 // 50 gibibytes
+}
+fn default_maximum_concurrent_uploads_per_user() -> u32 {
+    2
+}
+fn default_upload_idle_timeout_secs() -> u64 {
+    30
 }
 
 impl Default for ServerConfiguration {
@@ -516,6 +540,20 @@ max_bytes = 2097152
 # When omitted, defaults to 5368709120 (5 GB).
 max_bytes = 5368709120
 
+# The maximum total logical size of file messages sent by one user.
+# Identical files sent more than once count once for each file message.
+# When omitted, defaults to 53687091200 (50 GB).
+per_user_quota_bytes = 53687091200
+
+# The maximum number of uploads one user may have in progress.
+# When omitted, defaults to 2.
+maximum_concurrent_uploads_per_user = 2
+
+# The maximum time to wait for the next multipart upload chunk in seconds.
+# Each received chunk starts a new wait; total upload duration is unrestricted.
+# When omitted, defaults to 30.
+upload_idle_timeout_secs = 30
+
 # Whether file upload and download speed limits are enabled.
 # When omitted, defaults to false.
 transfer_rate_limit_enabled = false
@@ -621,6 +659,21 @@ download_mibps = 0
         }
         if self.file.max_bytes == 0 {
             bail!("The file max bytes cannot be 0.");
+        }
+        if self.file.per_user_quota_bytes == 0 {
+            bail!("The file per-user quota cannot be 0.");
+        }
+        if self.file.max_bytes > self.file.per_user_quota_bytes {
+            bail!("The file max bytes cannot exceed the per-user quota.");
+        }
+        if self.file.per_user_quota_bytes > i64::MAX as u64 {
+            bail!("The file per-user quota cannot exceed the database integer range.");
+        }
+        if self.file.maximum_concurrent_uploads_per_user == 0 {
+            bail!("The maximum concurrent uploads per user cannot be 0.");
+        }
+        if self.file.upload_idle_timeout_secs == 0 {
+            bail!("The file upload idle timeout cannot be 0.");
         }
         if self.file.transfer_rate_limit_enabled
             && (self.file.upload_mibps == 0 || self.file.download_mibps == 0)

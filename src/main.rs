@@ -18,6 +18,7 @@ use infrastructure::environment::Environment;
 use infrastructure::initialize;
 use middleware::rate_limit::SlidingWindowRateLimiter;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,7 +41,7 @@ pub struct ServerState {
     pub avatars_directory: PathBuf,
     pub files_directory: PathBuf,
     pub file_uploads_directory: PathBuf,
-    pub file_operations: Arc<tokio::sync::Mutex<()>>,
+    pub active_file_uploads: Arc<std::sync::Mutex<HashMap<uuid::Uuid, u32>>>,
     pub(crate) login_rate_limiter: Arc<SlidingWindowRateLimiter>,
     pub(crate) register_rate_limiter: Arc<SlidingWindowRateLimiter>,
     pub(crate) shutting_down: Arc<AtomicBool>,

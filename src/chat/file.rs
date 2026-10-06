@@ -20,7 +20,7 @@ use sqlx::Row;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::warn;
 use uuid::Uuid;
@@ -31,18 +31,56 @@ struct PendingUploadedFile {
     byte_size: u64,
 }
 
+struct ActiveFileUpload {
+    active_uploads: Arc<std::sync::Mutex<std::collections::HashMap<Uuid, u32>>>,
+    user_id: Uuid,
+}
+
+impl Drop for ActiveFileUpload {
+    fn drop(&mut self) {
+        let Ok(mut active_uploads) = self.active_uploads.lock() else {
+            return;
+        };
+        if let Some(active_count) = active_uploads.get_mut(&self.user_id) {
+            *active_count = active_count.saturating_sub(1);
+            if *active_count == 0 {
+                active_uploads.remove(&self.user_id);
+            }
+        }
+    }
+}
+
 pub async fn upload_file(
     State(state): State<Arc<ServerState>>,
     Extension(authenticated_user): Extension<AuthenticatedUser>,
     Path(room_id): Path<Uuid>,
     mut multipart: Multipart,
 ) -> Result<StandardResponse, ErrorResponse> {
+    let _active_upload = begin_file_upload(&state, authenticated_user.user_id)?;
     find_room_by_id(&state.pool, room_id).await?;
     if !is_room_member(&state.pool, room_id, authenticated_user.user_id).await? {
         return Err(ErrorResponse::Forbidden(
             "You are not a member of this room.".to_string(),
         ));
     }
+    let current_file_bytes = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(SUM(file_attachments.byte_size), 0)::BIGINT FROM file_attachments JOIN messages ON messages.id = file_attachments.message_id WHERE messages.sender_id = $1",
+    )
+    .bind(authenticated_user.user_id)
+    .fetch_one(&state.pool)
+    .await?;
+    let available_quota_before_upload = state
+        .configuration
+        .file
+        .per_user_quota_bytes
+        .saturating_sub(current_file_bytes.max(0) as u64);
+    if available_quota_before_upload == 0 {
+        return Err(ErrorResponse::PayloadTooLarge(
+            "File storage quota exceeded.".to_string(),
+        ));
+    }
+    let upload_idle_timeout =
+        Duration::from_secs(state.configuration.file.upload_idle_timeout_secs);
 
     let mut supplied_hash = None;
     let mut encrypted_metadata = None;
@@ -51,46 +89,79 @@ pub async fn upload_file(
     let mut media_type = None;
 
     loop {
-        let next_field = match multipart.next_field().await {
-            Ok(next_field) => next_field,
-            Err(error) => {
-                if let Some(uploaded_file) = &uploaded_file {
-                    remove_file_if_exists(&uploaded_file.path).await;
+        let next_field =
+            match tokio::time::timeout(upload_idle_timeout, multipart.next_field()).await {
+                Ok(Ok(next_field)) => next_field,
+                Ok(Err(error)) => {
+                    if let Some(uploaded_file) = &uploaded_file {
+                        remove_file_if_exists(&uploaded_file.path).await;
+                    }
+                    return Err(ErrorResponse::BadRequest(format!(
+                        "Failed to read multipart field: {error}."
+                    )));
                 }
-                return Err(ErrorResponse::BadRequest(format!(
-                    "Failed to read multipart field: {error}."
-                )));
-            }
-        };
+                Err(_) => {
+                    if let Some(uploaded_file) = &uploaded_file {
+                        remove_file_if_exists(&uploaded_file.path).await;
+                    }
+                    return Err(upload_stalled_error(
+                        state.configuration.file.upload_idle_timeout_secs,
+                    ));
+                }
+            };
         let Some(mut field) = next_field else {
             break;
         };
         match field.name() {
             Some("sha256") => {
-                supplied_hash = Some(match field.text().await {
-                    Ok(hash) => hash,
-                    Err(error) => {
-                        if let Some(uploaded_file) = &uploaded_file {
-                            remove_file_if_exists(&uploaded_file.path).await;
+                supplied_hash = Some(
+                    match read_bounded_text(&mut field, 64, "File hash", upload_idle_timeout).await
+                    {
+                        Ok(hash) => hash,
+                        Err(error @ ErrorResponse::RequestTimeout(_)) => {
+                            if let Some(uploaded_file) = &uploaded_file {
+                                remove_file_if_exists(&uploaded_file.path).await;
+                            }
+                            return Err(error);
                         }
-                        return Err(ErrorResponse::BadRequest(format!(
-                            "Failed to read file hash: {error}."
-                        )));
-                    }
-                });
+                        Err(error) => {
+                            if let Some(uploaded_file) = &uploaded_file {
+                                remove_file_if_exists(&uploaded_file.path).await;
+                            }
+                            return Err(ErrorResponse::BadRequest(format!(
+                                "Failed to read file hash: {error}."
+                            )));
+                        }
+                    },
+                );
             }
             Some("encrypted_metadata") => {
-                encrypted_metadata = Some(match field.text().await {
-                    Ok(metadata) => metadata,
-                    Err(error) => {
-                        if let Some(uploaded_file) = &uploaded_file {
-                            remove_file_if_exists(&uploaded_file.path).await;
+                encrypted_metadata = Some(
+                    match read_bounded_text(
+                        &mut field,
+                        8192,
+                        "Encrypted metadata",
+                        upload_idle_timeout,
+                    )
+                    .await
+                    {
+                        Ok(metadata) => metadata,
+                        Err(error @ ErrorResponse::RequestTimeout(_)) => {
+                            if let Some(uploaded_file) = &uploaded_file {
+                                remove_file_if_exists(&uploaded_file.path).await;
+                            }
+                            return Err(error);
                         }
-                        return Err(ErrorResponse::BadRequest(format!(
-                            "Failed to read encrypted metadata: {error}."
-                        )));
-                    }
-                });
+                        Err(error) => {
+                            if let Some(uploaded_file) = &uploaded_file {
+                                remove_file_if_exists(&uploaded_file.path).await;
+                            }
+                            return Err(ErrorResponse::BadRequest(format!(
+                                "Failed to read encrypted metadata: {error}."
+                            )));
+                        }
+                    },
+                );
             }
             Some("file") => {
                 if uploaded_file.is_some() {
@@ -103,7 +174,10 @@ pub async fn upload_file(
                 }
                 original_name = field.file_name().map(str::to_string);
                 media_type = field.content_type().map(str::to_string);
-                uploaded_file = Some(receive_uploaded_file(&state, &mut field).await?);
+                uploaded_file = Some(
+                    receive_uploaded_file(&state, &mut field, available_quota_before_upload)
+                        .await?,
+                );
             }
             _ => {}
         }
@@ -140,7 +214,6 @@ pub async fn upload_file(
         ));
     }
 
-    let _file_operation = state.file_operations.lock().await;
     let mut transaction = match state.pool.begin().await {
         Ok(transaction) => transaction,
         Err(error) => {
@@ -164,19 +237,20 @@ pub async fn upload_file(
                 return Err(error.into());
             }
         };
-    let still_member =
-        match sqlx::query("SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2")
-            .bind(room_id)
-            .bind(authenticated_user.user_id)
-            .fetch_optional(&mut *transaction)
-            .await
-        {
-            Ok(member) => member.is_some(),
-            Err(error) => {
-                remove_file_if_exists(&uploaded_file.path).await;
-                return Err(error.into());
-            }
-        };
+    let still_member = match sqlx::query(
+        "SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2 FOR UPDATE",
+    )
+    .bind(room_id)
+    .bind(authenticated_user.user_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    {
+        Ok(member) => member.is_some(),
+        Err(error) => {
+            remove_file_if_exists(&uploaded_file.path).await;
+            return Err(error.into());
+        }
+    };
     if !still_member {
         remove_file_if_exists(&uploaded_file.path).await;
         return Err(ErrorResponse::Forbidden(
@@ -255,17 +329,64 @@ pub async fn upload_file(
         supplied_type
     };
 
+    if let Err(error) = sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("file-user:{}", authenticated_user.user_id))
+        .execute(&mut *transaction)
+        .await
+    {
+        remove_file_if_exists(&uploaded_file.path).await;
+        return Err(error.into());
+    }
+    let current_file_bytes = match sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(SUM(file_attachments.byte_size), 0)::BIGINT FROM file_attachments JOIN messages ON messages.id = file_attachments.message_id WHERE messages.sender_id = $1",
+    )
+    .bind(authenticated_user.user_id)
+    .fetch_one(&mut *transaction)
+    .await
+    {
+        Ok(current_file_bytes) => current_file_bytes,
+        Err(error) => {
+            remove_file_if_exists(&uploaded_file.path).await;
+            return Err(error.into());
+        }
+    };
+    let available_quota = state
+        .configuration
+        .file
+        .per_user_quota_bytes
+        .saturating_sub(current_file_bytes.max(0) as u64);
+    if uploaded_file.byte_size > available_quota {
+        remove_file_if_exists(&uploaded_file.path).await;
+        return Err(ErrorResponse::PayloadTooLarge(
+            "File storage quota exceeded.".to_string(),
+        ));
+    }
+
     let actual_hash = uploaded_file.content_hash.clone();
+    if let Err(error) = sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("stored-file:{actual_hash}"))
+        .execute(&mut *transaction)
+        .await
+    {
+        remove_file_if_exists(&uploaded_file.path).await;
+        return Err(error.into());
+    }
     let file_path = state.files_directory.join(&actual_hash);
-    let target_exists = tokio::fs::try_exists(&file_path).await.map_err(|error| {
-        ErrorResponse::InternalError(format!("Failed to inspect stored file: {error}."))
-    })?;
+    let target_exists = match tokio::fs::try_exists(&file_path).await {
+        Ok(target_exists) => target_exists,
+        Err(error) => {
+            remove_file_if_exists(&uploaded_file.path).await;
+            return Err(ErrorResponse::InternalError(format!(
+                "Failed to inspect stored file: {error}."
+            )));
+        }
+    };
     let newly_saved = if target_exists {
         remove_file_if_exists(&uploaded_file.path).await;
         false
     } else {
         match tokio::fs::rename(&uploaded_file.path, &file_path).await {
-            Ok(()) => true,
+            Ok(()) => {}
             Err(error) => {
                 remove_file_if_exists(&uploaded_file.path).await;
                 return Err(ErrorResponse::InternalError(format!(
@@ -273,6 +394,7 @@ pub async fn upload_file(
                 )));
             }
         }
+        true
     };
 
     let message_id = Uuid::now_v7();
@@ -292,8 +414,11 @@ pub async fn upload_file(
         Ok::<(), ErrorResponse>(())
     }.await;
     if let Err(error) = save_result {
-        if newly_saved {
-            let _ = tokio::fs::remove_file(&file_path).await;
+        if newly_saved
+            && let Err(cleanup_error) =
+                remove_newly_saved_file_if_unreferenced(&state, &actual_hash, &file_path).await
+        {
+            warn!("Failed to inspect file after database write error: {cleanup_error}");
         }
         return Err(error);
     }
@@ -337,13 +462,14 @@ pub async fn download_file(
         ));
     }
     let row = sqlx::query(
-        "SELECT file_attachments.content_hash, file_attachments.original_name, file_attachments.media_type, file_attachments.encrypted FROM file_attachments JOIN messages ON messages.id = file_attachments.message_id WHERE messages.id = $1 AND messages.room_id = $2",
+        "SELECT file_attachments.content_hash, file_attachments.original_name, file_attachments.media_type, file_attachments.byte_size, file_attachments.encrypted FROM file_attachments JOIN messages ON messages.id = file_attachments.message_id WHERE messages.id = $1 AND messages.room_id = $2",
     )
     .bind(message_id).bind(room_id).fetch_optional(&state.pool).await?
     .ok_or_else(|| ErrorResponse::NotFound("File not found.".to_string()))?;
     let content_hash = row.get::<String, _>("content_hash");
     let original_name = row.get::<String, _>("original_name");
     let media_type = row.get::<String, _>("media_type");
+    let byte_size = row.get::<i64, _>("byte_size");
     let encrypted = row.get::<bool, _>("encrypted");
     let file = tokio::fs::File::open(state.files_directory.join(content_hash.trim()))
         .await
@@ -370,7 +496,9 @@ pub async fn download_file(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_DISPOSITION, content_disposition)
+        .header(header::CONTENT_LENGTH, byte_size)
         .header(header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
         .body(body)
         .map_err(|error| {
             ErrorResponse::InternalError(format!("Failed to build response: {error}."))
@@ -382,11 +510,16 @@ pub(crate) async fn delete_unreferenced_files(
     hashes: Vec<String>,
 ) -> Result<(), ErrorResponse> {
     for hash in hashes {
+        let mut transaction = state.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("stored-file:{}", hash.trim()))
+            .execute(&mut *transaction)
+            .await?;
         let reference_count = sqlx::query_scalar::<_, i64>(
-            "SELECT reference_count FROM stored_files WHERE content_hash = $1",
+            "SELECT reference_count FROM stored_files WHERE content_hash = $1 FOR UPDATE",
         )
         .bind(&hash)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&mut *transaction)
         .await?;
         if reference_count != Some(0) {
             continue;
@@ -401,14 +534,14 @@ pub(crate) async fn delete_unreferenced_files(
         }
         sqlx::query("DELETE FROM stored_files WHERE content_hash = $1 AND reference_count = 0")
             .bind(&hash)
-            .execute(&state.pool)
+            .execute(&mut *transaction)
             .await?;
+        transaction.commit().await?;
     }
     Ok(())
 }
 
 pub(crate) async fn cleanup_pending_files(state: &ServerState) -> Result<(), ErrorResponse> {
-    let _file_operation = state.file_operations.lock().await;
     let hashes = sqlx::query_scalar::<_, String>(
         "SELECT content_hash FROM stored_files WHERE reference_count = 0",
     )
@@ -424,15 +557,73 @@ pub(crate) async fn delete_room_with_files(
     state: &ServerState,
     room_id: Uuid,
 ) -> Result<(), ErrorResponse> {
-    let _file_operation = state.file_operations.lock().await;
+    let mut transaction = state.pool.begin().await?;
+    sqlx::query("SELECT 1 FROM rooms WHERE id = $1 FOR UPDATE")
+        .bind(room_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
     let hashes = sqlx::query_scalar::<_, String>(
         "SELECT DISTINCT file_attachments.content_hash FROM file_attachments JOIN messages ON messages.id = file_attachments.message_id WHERE messages.room_id = $1",
-    ).bind(room_id).fetch_all(&state.pool).await?;
+    ).bind(room_id).fetch_all(&mut *transaction).await?;
     sqlx::query("DELETE FROM rooms WHERE id = $1")
         .bind(room_id)
-        .execute(&state.pool)
+        .execute(&mut *transaction)
         .await?;
+    transaction.commit().await?;
     delete_unreferenced_files(state, hashes).await
+}
+
+// TODO: A client can keep one of these slots open indefinitely by sending a chunk within every
+// idle window, so the remaining controls are this per-user slot count and the bandwidth limit,
+// which is disabled by default.
+fn begin_file_upload(
+    state: &ServerState,
+    user_id: Uuid,
+) -> Result<ActiveFileUpload, ErrorResponse> {
+    let mut active_uploads = state.active_file_uploads.lock().map_err(|error| {
+        ErrorResponse::InternalError(format!("Failed to track active file uploads: {error}."))
+    })?;
+    let active_count = active_uploads.entry(user_id).or_insert(0);
+    if *active_count >= state.configuration.file.maximum_concurrent_uploads_per_user {
+        return Err(ErrorResponse::TooManyRequests(
+            "Too many file uploads are already in progress.".to_string(),
+        ));
+    }
+    *active_count += 1;
+    drop(active_uploads);
+    Ok(ActiveFileUpload {
+        active_uploads: state.active_file_uploads.clone(),
+        user_id,
+    })
+}
+
+async fn read_bounded_text(
+    field: &mut Field<'_>,
+    maximum_bytes: usize,
+    field_label: &str,
+    upload_idle_timeout: Duration,
+) -> Result<String, ErrorResponse> {
+    let mut value = Vec::with_capacity(maximum_bytes.min(1024));
+    while let Some(chunk) = tokio::time::timeout(upload_idle_timeout, field.chunk())
+        .await
+        .map_err(|_| upload_stalled_error(upload_idle_timeout.as_secs()))?
+        .map_err(|error| {
+            ErrorResponse::BadRequest(format!(
+                "Failed to read {}: {error}.",
+                field_label.to_lowercase()
+            ))
+        })?
+    {
+        if value.len().saturating_add(chunk.len()) > maximum_bytes {
+            return Err(ErrorResponse::Validation(format!(
+                "{field_label} exceeds {maximum_bytes} bytes."
+            )));
+        }
+        value.extend_from_slice(&chunk);
+    }
+    String::from_utf8(value).map_err(|error| {
+        ErrorResponse::Validation(format!("{field_label} is not valid UTF-8: {error}."))
+    })
 }
 
 pub(crate) fn upload_body_limit_layer(state: &ServerState) -> DefaultBodyLimit {
@@ -449,6 +640,7 @@ pub(crate) fn upload_body_limit_layer(state: &ServerState) -> DefaultBodyLimit {
 async fn receive_uploaded_file(
     state: &ServerState,
     field: &mut Field<'_>,
+    available_quota_before_upload: u64,
 ) -> Result<PendingUploadedFile, ErrorResponse> {
     let temporary_path = state
         .file_uploads_directory
@@ -464,11 +656,28 @@ async fn receive_uploaded_file(
     let mut hasher = Sha256::new();
     let mut byte_size = 0_u64;
     let started_at = Instant::now();
-    while let Some(chunk) = field
-        .chunk()
+    loop {
+        let chunk = match tokio::time::timeout(
+            Duration::from_secs(state.configuration.file.upload_idle_timeout_secs),
+            field.chunk(),
+        )
         .await
-        .map_err(|error| ErrorResponse::BadRequest(format!("Failed to read file: {error}.")))?
-    {
+        {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
+                remove_file_if_exists(&temporary_path).await;
+                return Err(ErrorResponse::BadRequest(format!(
+                    "Failed to read file: {error}."
+                )));
+            }
+            Err(_) => {
+                remove_file_if_exists(&temporary_path).await;
+                return Err(upload_stalled_error(
+                    state.configuration.file.upload_idle_timeout_secs,
+                ));
+            }
+        };
         byte_size = byte_size.saturating_add(chunk.len() as u64);
         if byte_size > state.configuration.file.max_bytes {
             remove_file_if_exists(&temporary_path).await;
@@ -476,9 +685,18 @@ async fn receive_uploaded_file(
                 "File exceeds the configured file size.".to_string(),
             ));
         }
-        file.write_all(&chunk).await.map_err(|error| {
-            ErrorResponse::InternalError(format!("Failed to write upload file: {error}."))
-        })?;
+        if byte_size > available_quota_before_upload {
+            remove_file_if_exists(&temporary_path).await;
+            return Err(ErrorResponse::PayloadTooLarge(
+                "File storage quota exceeded.".to_string(),
+            ));
+        }
+        if let Err(error) = file.write_all(&chunk).await {
+            remove_file_if_exists(&temporary_path).await;
+            return Err(ErrorResponse::InternalError(format!(
+                "Failed to write upload file: {error}."
+            )));
+        }
         hasher.update(&chunk);
         throttle_transfer(
             state.configuration.file.transfer_rate_limit_enabled,
@@ -488,14 +706,29 @@ async fn receive_uploaded_file(
         )
         .await;
     }
-    file.flush().await.map_err(|error| {
-        ErrorResponse::InternalError(format!("Failed to flush upload file: {error}."))
-    })?;
+    if let Err(error) = file.flush().await {
+        remove_file_if_exists(&temporary_path).await;
+        return Err(ErrorResponse::InternalError(format!(
+            "Failed to flush upload file: {error}."
+        )));
+    }
+    if let Err(error) = file.sync_all().await {
+        remove_file_if_exists(&temporary_path).await;
+        return Err(ErrorResponse::InternalError(format!(
+            "Failed to synchronize upload file: {error}."
+        )));
+    }
     Ok(PendingUploadedFile {
         path: temporary_path,
         content_hash: format!("{:x}", hasher.finalize()),
         byte_size,
     })
+}
+
+fn upload_stalled_error(timeout_seconds: u64) -> ErrorResponse {
+    ErrorResponse::RequestTimeout(format!(
+        "The file upload received no data for {timeout_seconds} seconds."
+    ))
 }
 
 async fn cleanup_orphaned_completed_files(state: &ServerState) -> Result<(), ErrorResponse> {
@@ -605,6 +838,28 @@ async fn remove_file_if_exists(path: &PathBuf) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => warn!("Failed to remove file {}: {}", path.display(), error),
     }
+}
+
+async fn remove_newly_saved_file_if_unreferenced(
+    state: &ServerState,
+    content_hash: &str,
+    file_path: &PathBuf,
+) -> Result<(), ErrorResponse> {
+    let mut transaction = state.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("stored-file:{content_hash}"))
+        .execute(&mut *transaction)
+        .await?;
+    let stored_file_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM stored_files WHERE content_hash = $1)")
+            .bind(content_hash)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if !stored_file_exists {
+        remove_file_if_exists(file_path).await;
+    }
+    transaction.commit().await?;
+    Ok(())
 }
 
 fn percent_encode_filename(filename: &str) -> String {

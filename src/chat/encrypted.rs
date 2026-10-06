@@ -434,10 +434,27 @@ pub(crate) async fn cleanup_encrypted_room(
     offline_user_id: Option<Uuid>,
     pool: &PgPool,
 ) {
-    let _file_operation = state.file_operations.lock().await;
+    let mut transaction = match pool.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            error!(
+                "Failed to begin encrypted room cleanup for {}: {}",
+                room_id, error
+            );
+            return;
+        }
+    };
+    if let Err(error) = sqlx::query("SELECT 1 FROM rooms WHERE id = $1 FOR UPDATE")
+        .bind(room_id)
+        .fetch_optional(&mut *transaction)
+        .await
+    {
+        error!("Failed to lock encrypted room {}: {}", room_id, error);
+        return;
+    }
     let hashes = sqlx::query_scalar::<_, String>(
         "SELECT DISTINCT file_attachments.content_hash FROM file_attachments JOIN messages ON messages.id = file_attachments.message_id WHERE messages.room_id = $1",
-    ).bind(room_id).fetch_all(pool).await;
+    ).bind(room_id).fetch_all(&mut *transaction).await;
     let hashes = match hashes {
         Ok(hashes) => hashes,
         Err(error) => {
@@ -447,25 +464,33 @@ pub(crate) async fn cleanup_encrypted_room(
     };
     if let Err(error) = sqlx::query("DELETE FROM messages WHERE room_id = $1")
         .bind(room_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
     {
         error!("Failed to delete messages for room {}: {}", room_id, error);
         return;
     }
-    if let Err(error) = crate::chat::file::delete_unreferenced_files(state, hashes).await {
-        error!("Failed to clean files for room {}: {}", room_id, error);
-    }
     // Reset room encryption status.
     if let Err(error) = sqlx::query("UPDATE rooms SET is_encrypted = false WHERE id = $1")
         .bind(room_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
     {
         error!(
             "Failed to reset room encryption status for {}: {}",
             room_id, error
         );
+        return;
+    }
+    if let Err(error) = transaction.commit().await {
+        error!(
+            "Failed to commit encrypted room cleanup for {}: {}",
+            room_id, error
+        );
+        return;
+    }
+    if let Err(error) = crate::chat::file::delete_unreferenced_files(state, hashes).await {
+        error!("Failed to clean files for room {}: {}", room_id, error);
     }
 
     // Clear in-memory state.
@@ -473,8 +498,6 @@ pub(crate) async fn cleanup_encrypted_room(
     state.connection_manager.clear_pending(room_id);
     state.connection_manager.remove_ready_state(room_id);
     state.connection_manager.cancel_grace_period(room_id);
-    drop(_file_operation);
-
     // Notify participants.
     let reason = if terminated_by.is_some() {
         "user_left"

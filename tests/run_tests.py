@@ -75,12 +75,16 @@ def choose_port():
 
 
 class TestRun:
-    def __init__(self):
+    def __init__(self, container_mode=False):
         self.identifier = uuid.uuid4().hex[:12]
         self.project_name = f"baihua-test-{self.identifier}"
+        temporary_parent = Path.home() if container_mode and sys.platform == "darwin" else None
         self.temporary_directory = Path(
-            tempfile.mkdtemp(prefix=f"{self.project_name}-")
+            tempfile.mkdtemp(prefix=f"{self.project_name}-", dir=temporary_parent)
         )
+        self.test_files_directory = self.temporary_directory / "files"
+        self.test_files_directory.mkdir()
+        self.test_files_directory.chmod(0o777)
         LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
         self.server_log_path = LOG_DIRECTORY / f"server_{self.identifier}.log"
         self.server_log_file = None
@@ -94,6 +98,7 @@ class TestRun:
             "POSTGRES_DB": f"baihua_test_{self.identifier}",
             "JWT_SECRET": uuid.uuid4().hex + uuid.uuid4().hex,
             "BAIHUA_ENCRYPTED_GRACE_PERIOD_SECS": "5",
+            "BAIHUA_TEST_FILES_DIRECTORY": str(self.test_files_directory),
         })
 
     def compose_command(self, *arguments):
@@ -147,11 +152,13 @@ class TestRun:
         app_directory = self.temporary_directory / "app"
         app_directory.mkdir()
         (app_directory / "config.toml").write_text(
-            f'[web]\nhost = "127.0.0.1"\nport = {port}\n'
-            "[logs]\n[database]\n[user]\n",
+            f'[web]\nhost = "127.0.0.1"\nport = {port}\nrequest_timeout_secs = 2\n'
+            "[logs]\n[database]\n[user]\n"
+            "[file]\nmaximum_concurrent_uploads_per_user = 1\nupload_idle_timeout_secs = 4\n",
             encoding="utf-8",
         )
         self.environment["BAIHUA_DIR"] = str(app_directory)
+        self.environment["BAIHUA_TEST_FILES_DIRECTORY"] = str(app_directory / "files")
 
     def start_local_server(self):
         build = subprocess.run(
@@ -188,6 +195,23 @@ class TestRun:
         port = self.mapped_port("server", 2424, profile="container")
         self.server_url = f"http://127.0.0.1:{port}"
         self.wait_until_healthy()
+        self.verify_shared_files_directory()
+
+    def verify_shared_files_directory(self):
+        marker = f"mount-check-{self.identifier}"
+        marker_path = self.test_files_directory / marker
+        try:
+            self.compose(
+                "--profile", "container", "exec", "-T", "-u", "baihua",
+                "server", "touch", f"/app/.baihua/files/{marker}",
+            )
+            if not marker_path.is_file():
+                raise RuntimeError(
+                    "The container files directory is not shared with the host. "
+                    "On macOS, configure Colima to share the test directory."
+                )
+        finally:
+            marker_path.unlink(missing_ok=True)
 
     def wait_until_healthy(self):
         deadline = time.monotonic() + 60
@@ -266,7 +290,7 @@ def run():
     if not verify_collection():
         return 1
 
-    test_run = TestRun()
+    test_run = TestRun(container_mode=arguments.docker)
     completed = False
     try:
         if arguments.local:

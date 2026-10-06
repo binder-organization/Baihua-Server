@@ -34,6 +34,21 @@ pub async fn initialize(
             .parse()
             .context("Invalid encrypted session grace period.")?;
     }
+    if let Ok(request_timeout) = std::env::var("BAIHUA_REQUEST_TIMEOUT_SECS") {
+        configuration.web.request_timeout_secs = request_timeout
+            .parse()
+            .context("Invalid request timeout.")?;
+    }
+    if let Ok(maximum_uploads) = std::env::var("BAIHUA_MAXIMUM_CONCURRENT_UPLOADS_PER_USER") {
+        configuration.file.maximum_concurrent_uploads_per_user = maximum_uploads
+            .parse()
+            .context("Invalid maximum concurrent uploads per user.")?;
+    }
+    if let Ok(upload_idle_timeout) = std::env::var("BAIHUA_FILE_UPLOAD_IDLE_TIMEOUT_SECS") {
+        configuration.file.upload_idle_timeout_secs = upload_idle_timeout
+            .parse()
+            .context("Invalid file upload idle timeout.")?;
+    }
     configuration.validate()?;
 
     let directory = Directory {
@@ -96,8 +111,8 @@ pub async fn initialize(
         connection_manager: Arc::new(ConnectionManager::new()),
         avatars_directory: app_directory.join("avatars"),
         files_directory: app_directory.join("files"),
-        file_uploads_directory: app_directory.join("file_uploads"),
-        file_operations: Arc::new(tokio::sync::Mutex::new(())),
+        file_uploads_directory: app_directory.join("files").join("uploads"),
+        active_file_uploads: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         login_rate_limiter,
         register_rate_limiter,
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -113,7 +128,7 @@ pub async fn initialize(
 }
 
 async fn ensure_app_directories(app_directory: &Path) -> Result<()> {
-    let directories = vec!["logs", "avatars", "files", "file_uploads"];
+    let directories = vec!["logs", "avatars", "files", "files/uploads"];
 
     for directory_name in directories {
         let directory_path = app_directory.join(directory_name);
