@@ -200,10 +200,7 @@ async fn handle_leave(
 
     // If this is the last member, delete the room entirely (cascade handles messages + memberships).
     if member_count <= 1 {
-        sqlx::query("DELETE FROM rooms WHERE id = $1")
-            .bind(room_id)
-            .execute(&state.pool)
-            .await?;
+        crate::chat::file::delete_room_with_files(state, room_id).await?;
 
         state
             .connection_manager
@@ -222,7 +219,7 @@ async fn handle_leave(
 
     // For group rooms: if leaving user is an admin, try to auto-promote a successor before removing.
     if is_group && is_room_admin(&state.pool, room_id, user_id).await? {
-        auto_promote_admin(&state.pool, room_id, user_id).await?;
+        auto_promote_admin(state, room_id, user_id).await?;
     }
 
     // Remove the user from the room.
@@ -292,7 +289,7 @@ async fn handle_kick(
 
     // If the kicked user was an admin, auto-promote a successor.
     if target_is_admin {
-        auto_promote_admin(&state.pool, room_id, target_user_id).await?;
+        auto_promote_admin(state, room_id, target_user_id).await?;
     }
 
     Ok(StandardResponse::success(

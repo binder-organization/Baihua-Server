@@ -15,6 +15,8 @@ pub struct ServerConfiguration {
     pub room_request: RoomRequestConfiguration,
     #[serde(default)]
     pub avatar: AvatarConfiguration,
+    #[serde(default)]
+    pub file: FileConfiguration,
 }
 
 // Web server configuration
@@ -87,6 +89,40 @@ impl Default for RateLimitConfiguration {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::ServerConfiguration;
+
+    #[test]
+    fn default_file_configuration_uses_five_gib_without_rate_limit() {
+        let configuration = ServerConfiguration::default();
+
+        assert_eq!(configuration.file.max_bytes, 5 * 1024 * 1024 * 1024);
+        assert_eq!(
+            configuration.file.per_user_quota_bytes,
+            50 * 1024 * 1024 * 1024
+        );
+        assert_eq!(configuration.file.maximum_concurrent_uploads_per_user, 2);
+        assert_eq!(configuration.file.upload_idle_timeout_secs, 30);
+        assert!(!configuration.file.transfer_rate_limit_enabled);
+        assert_eq!(configuration.file.upload_mibps, 0);
+        assert_eq!(configuration.file.download_mibps, 0);
+    }
+
+    #[test]
+    fn enabled_file_rate_limit_requires_upload_and_download_rates() {
+        let mut configuration = ServerConfiguration::default();
+        configuration.file.transfer_rate_limit_enabled = true;
+        configuration.file.upload_mibps = 1;
+        configuration.file.download_mibps = 0;
+
+        assert!(configuration.validate().is_err());
+
+        configuration.file.download_mibps = 1;
+        assert!(configuration.validate().is_ok());
+    }
+}
+
 // WebSocket configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSocketConfiguration {
@@ -98,6 +134,8 @@ pub struct WebSocketConfiguration {
     pub message_rate_window_secs: u64,
     #[serde(default = "default_token_revalidate_interval_secs")]
     pub token_revalidate_interval_secs: u64,
+    #[serde(default = "default_encrypted_grace_period_secs")]
+    pub encrypted_grace_period_secs: u64,
     #[serde(default)]
     pub allowed_origins: Vec<String>,
 }
@@ -109,6 +147,7 @@ impl Default for WebSocketConfiguration {
             message_rate_limit: default_message_rate_limit(),
             message_rate_window_secs: default_message_rate_window_secs(),
             token_revalidate_interval_secs: default_token_revalidate_interval_secs(),
+            encrypted_grace_period_secs: default_encrypted_grace_period_secs(),
             allowed_origins: Vec::new(),
         }
     }
@@ -149,6 +188,39 @@ impl Default for AvatarConfiguration {
     fn default() -> Self {
         Self {
             max_bytes: default_avatar_max_bytes(),
+        }
+    }
+}
+
+// File message configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileConfiguration {
+    #[serde(default = "default_file_max_bytes")]
+    pub max_bytes: u64,
+    #[serde(default = "default_file_per_user_quota_bytes")]
+    pub per_user_quota_bytes: u64,
+    #[serde(default = "default_maximum_concurrent_uploads_per_user")]
+    pub maximum_concurrent_uploads_per_user: u32,
+    #[serde(default = "default_upload_idle_timeout_secs")]
+    pub upload_idle_timeout_secs: u64,
+    #[serde(default)]
+    pub transfer_rate_limit_enabled: bool,
+    #[serde(default)]
+    pub upload_mibps: u32,
+    #[serde(default)]
+    pub download_mibps: u32,
+}
+
+impl Default for FileConfiguration {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_file_max_bytes(),
+            per_user_quota_bytes: default_file_per_user_quota_bytes(),
+            maximum_concurrent_uploads_per_user: default_maximum_concurrent_uploads_per_user(),
+            upload_idle_timeout_secs: default_upload_idle_timeout_secs(),
+            transfer_rate_limit_enabled: false,
+            upload_mibps: 0,
+            download_mibps: 0,
         }
     }
 }
@@ -211,6 +283,9 @@ fn default_message_rate_window_secs() -> u64 {
 fn default_token_revalidate_interval_secs() -> u64 {
     600
 }
+fn default_encrypted_grace_period_secs() -> u64 {
+    30
+}
 fn default_room_request_message_max_bytes() -> u32 {
     500
 }
@@ -225,6 +300,18 @@ fn default_room_request_send_daily_limit() -> u32 {
 }
 fn default_avatar_max_bytes() -> u32 {
     2 * 1024 * 1024 // 2 MB
+}
+fn default_file_max_bytes() -> u64 {
+    5 * 1024 * 1024 * 1024 // 5 GB
+}
+fn default_file_per_user_quota_bytes() -> u64 {
+    50 * 1024 * 1024 * 1024 // 50 gibibytes
+}
+fn default_maximum_concurrent_uploads_per_user() -> u32 {
+    2
+}
+fn default_upload_idle_timeout_secs() -> u64 {
+    30
 }
 
 impl Default for ServerConfiguration {
@@ -257,6 +344,7 @@ impl Default for ServerConfiguration {
             avatar: AvatarConfiguration {
                 max_bytes: default_avatar_max_bytes(),
             },
+            file: FileConfiguration::default(),
         }
     }
 }
@@ -406,6 +494,10 @@ message_rate_window_secs = 10
 # active WebSocket connection. When omitted, defaults to 600 (10 min).
 token_revalidate_interval_secs = 600
 
+# Time allowed for an encrypted chat partner to reconnect after disconnecting.
+# When omitted, defaults to 30 seconds. Must be greater than 0.
+encrypted_grace_period_secs = 30
+
 # List of browser origins allowed to open a WebSocket connection. When a
 # browser sends an Origin header that is not in this list, the upgrade is
 # rejected with a 403. Non-browser clients (which send no Origin header)
@@ -440,6 +532,39 @@ send_daily_limit = 20
 #
 # Uploads exceeding this size are rejected with a 413 Payload Too Large.
 max_bytes = 2097152
+
+# ---- Files ----
+
+[file]
+# The maximum size of a file message in bytes.
+# When omitted, defaults to 5368709120 (5 GB).
+max_bytes = 5368709120
+
+# The maximum total logical size of file messages sent by one user.
+# Identical files sent more than once count once for each file message.
+# When omitted, defaults to 53687091200 (50 GB).
+per_user_quota_bytes = 53687091200
+
+# The maximum number of uploads one user may have in progress.
+# When omitted, defaults to 2.
+maximum_concurrent_uploads_per_user = 2
+
+# The maximum time to wait for the next multipart upload chunk in seconds.
+# Each received chunk starts a new wait; total upload duration is unrestricted.
+# When omitted, defaults to 30.
+upload_idle_timeout_secs = 30
+
+# Whether file upload and download speed limits are enabled.
+# When omitted, defaults to false.
+transfer_rate_limit_enabled = false
+
+# Upload speed limit in mebibits per second.
+# Ignored when transfer_rate_limit_enabled is false.
+upload_mibps = 0
+
+# Download speed limit in mebibits per second.
+# Ignored when transfer_rate_limit_enabled is false.
+download_mibps = 0
 "#
         .to_string()
     }
@@ -512,6 +637,9 @@ max_bytes = 2097152
         if self.websocket.token_revalidate_interval_secs == 0 {
             bail!("The WebSocket token revalidate interval cannot be 0.");
         }
+        if self.websocket.encrypted_grace_period_secs == 0 {
+            bail!("The encrypted session grace period cannot be 0.");
+        }
 
         if self.room_request.message_max_bytes == 0 {
             bail!("The room request message max bytes cannot be 0.");
@@ -528,6 +656,31 @@ max_bytes = 2097152
 
         if self.avatar.max_bytes == 0 {
             bail!("The avatar max bytes cannot be 0.");
+        }
+        if self.file.max_bytes == 0 {
+            bail!("The file max bytes cannot be 0.");
+        }
+        if self.file.per_user_quota_bytes == 0 {
+            bail!("The file per-user quota cannot be 0.");
+        }
+        if self.file.max_bytes > self.file.per_user_quota_bytes {
+            bail!("The file max bytes cannot exceed the per-user quota.");
+        }
+        if self.file.per_user_quota_bytes > i64::MAX as u64 {
+            bail!("The file per-user quota cannot exceed the database integer range.");
+        }
+        if self.file.maximum_concurrent_uploads_per_user == 0 {
+            bail!("The maximum concurrent uploads per user cannot be 0.");
+        }
+        if self.file.upload_idle_timeout_secs == 0 {
+            bail!("The file upload idle timeout cannot be 0.");
+        }
+        if self.file.transfer_rate_limit_enabled
+            && (self.file.upload_mibps == 0 || self.file.download_mibps == 0)
+        {
+            bail!(
+                "The file upload and download limits cannot be 0 when file transfer rate limiting is enabled."
+            );
         }
 
         Ok(())

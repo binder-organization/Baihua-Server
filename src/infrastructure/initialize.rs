@@ -28,7 +28,27 @@ pub async fn initialize(
     ensure_app_directories(&app_directory).await?;
 
     // Load configuration.
-    let configuration = load_or_create_profile(&app_directory).await?;
+    let mut configuration = load_or_create_profile(&app_directory).await?;
+    if let Ok(grace_period) = std::env::var("BAIHUA_ENCRYPTED_GRACE_PERIOD_SECS") {
+        configuration.websocket.encrypted_grace_period_secs = grace_period
+            .parse()
+            .context("Invalid encrypted session grace period.")?;
+    }
+    if let Ok(request_timeout) = std::env::var("BAIHUA_REQUEST_TIMEOUT_SECS") {
+        configuration.web.request_timeout_secs = request_timeout
+            .parse()
+            .context("Invalid request timeout.")?;
+    }
+    if let Ok(maximum_uploads) = std::env::var("BAIHUA_MAXIMUM_CONCURRENT_UPLOADS_PER_USER") {
+        configuration.file.maximum_concurrent_uploads_per_user = maximum_uploads
+            .parse()
+            .context("Invalid maximum concurrent uploads per user.")?;
+    }
+    if let Ok(upload_idle_timeout) = std::env::var("BAIHUA_FILE_UPLOAD_IDLE_TIMEOUT_SECS") {
+        configuration.file.upload_idle_timeout_secs = upload_idle_timeout
+            .parse()
+            .context("Invalid file upload idle timeout.")?;
+    }
     configuration.validate()?;
 
     let directory = Directory {
@@ -90,10 +110,17 @@ pub async fn initialize(
         environment,
         connection_manager: Arc::new(ConnectionManager::new()),
         avatars_directory: app_directory.join("avatars"),
+        files_directory: app_directory.join("files"),
+        file_uploads_directory: app_directory.join("files").join("uploads"),
+        active_file_uploads: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         login_rate_limiter,
         register_rate_limiter,
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
+
+    crate::chat::file::cleanup_pending_files(&state)
+        .await
+        .context("Failed to clean pending stored files.")?;
 
     info!("Initialization completed.");
 
@@ -101,7 +128,7 @@ pub async fn initialize(
 }
 
 async fn ensure_app_directories(app_directory: &Path) -> Result<()> {
-    let directories = vec!["logs", "avatars"];
+    let directories = vec!["logs", "avatars", "files", "files/uploads"];
 
     for directory_name in directories {
         let directory_path = app_directory.join(directory_name);

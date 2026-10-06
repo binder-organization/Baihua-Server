@@ -13,43 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: build and start
-        run: |
-          cat > .env.ci << 'EOF'
-          JWT_SECRET=ci-test-secret-key-not-for-production
-          POSTGRES_USER=baihua_test
-          POSTGRES_PASSWORD=test_pass
-          POSTGRES_DB=baihua_test
-          EOF
-          docker compose --profile production --env-file .env.ci up -d --build
-
-      - name: wait for health
-        run: |
-          for i in $(seq 1 20); do
-            if curl -sf http://localhost:2424/health > /dev/null 2>&1; then
-              echo "server is healthy."
-              exit 0
-            fi
-            echo "waiting... ($i/20)"
-            sleep 3
-          done
-          echo "server failed to start."
-          docker compose logs server
-          exit 1
-
-      - name: smoke tests
-        run: curl -sf http://localhost:2424/greet
-
       - name: install python deps
         run: pip install -r tests/requirements.txt
 
       - name: integration tests
-        run: python3 -m pytest tests/ -v --tb=short
-
-      - name: container logs on failure
-        if: failure()
-        run: docker compose --profile production logs
-
-      - name: cleanup
-        if: always()
-        run: docker compose --profile production down -v
+        run: python3 tests/run_tests.py --docker --skip-checks

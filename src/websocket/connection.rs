@@ -10,11 +10,14 @@ type RoomSubKey = (Uuid, Uuid);
 // Manages all active WebSocket connections:
 // - Per-room broadcast channels for real-time message delivery.
 // - Per-user connection counters for online/offline presence.
-// - Per-(user, room) cancel signals so leaving a room auto-unsubscribes WS.
+// - Per-connection cancel signals so each connection can be independently
+//   unsubscribed without affecting other connections for the same user+room.
 pub struct ConnectionManager {
     rooms: RwLock<HashMap<Uuid, broadcast::Sender<String>>>,
     user_connections: RwLock<HashMap<Uuid, usize>>,
-    subs: RwLock<HashMap<RoomSubKey, watch::Sender<bool>>>,
+    // (user_id, room_id) -> { subscription_id -> watch::Sender }
+    // Each connection gets its own watch channel; leave/kick cancels all.
+    subs: RwLock<HashMap<RoomSubKey, HashMap<Uuid, watch::Sender<bool>>>>,
 
     // Encrypted session state
     active_sessions: RwLock<HashMap<Uuid, Instant>>,
@@ -76,34 +79,57 @@ impl ConnectionManager {
         }
     }
 
-    // Register that a user has subscribed to a room.
-    // Returns a Receiver that fires when the subscription should be canceled.
-    // (user left/kicked from the room).
-    pub fn register_subscription(&self, user_id: Uuid, room_id: Uuid) -> watch::Receiver<bool> {
+    // Register a new subscription for a user in a room.
+    // Returns (Receiver, subscription_id). Each call creates an independent
+    // watch channel so disconnect cleanup only affects its own forward task.
+    pub fn register_subscription(
+        &self,
+        user_id: Uuid,
+        room_id: Uuid,
+    ) -> (watch::Receiver<bool>, Uuid) {
+        let subscription_id = Uuid::now_v7();
+        let (tx, rx) = watch::channel(false);
         let mut subs = self
             .subs
             .write()
             .expect("ConnectionManager subs lock poisoned");
-        let tx = subs
-            .entry((user_id, room_id))
-            .or_insert_with(|| {
-                let (tx, _) = watch::channel(false);
-                tx
-            })
-            .clone();
-        tx.subscribe()
+        subs.entry((user_id, room_id))
+            .or_default()
+            .insert(subscription_id, tx);
+        (rx, subscription_id)
     }
 
-    // Cancel a user's subscription to a room (user left or was kicked).
-    // All forward tasks for this (user, room) will exit.
+    // Unconditionally cancel ALL subscriptions for a user in a room.
+    // Used for explicit leave/kick where every connection must be unsubscribed.
     pub fn cancel_subscription(&self, user_id: Uuid, room_id: Uuid) {
-        if let Some(tx) = self
+        if let Some(senders) = self
             .subs
             .write()
             .expect("ConnectionManager subs lock poisoned")
             .remove(&(user_id, room_id))
         {
-            let _ = tx.send(true);
+            for (_, sender) in senders {
+                let _ = sender.send(true);
+            }
+        }
+    }
+
+    // Cancel a single subscription by its ID.
+    // Used during disconnect cleanup so only this connection's forward task
+    // exits; other connections for the same user+room are unaffected.
+    // Also removes the inner entry; cleans up the outer map when empty.
+    pub fn cancel_stale_subscription(&self, user_id: Uuid, room_id: Uuid, subscription_id: Uuid) {
+        let mut subs = self
+            .subs
+            .write()
+            .expect("ConnectionManager subs lock poisoned");
+        if let Some(senders) = subs.get_mut(&(user_id, room_id)) {
+            if let Some(sender) = senders.remove(&subscription_id) {
+                let _ = sender.send(true);
+            }
+            if senders.is_empty() {
+                subs.remove(&(user_id, room_id));
+            }
         }
     }
 
@@ -229,16 +255,13 @@ impl ConnectionManager {
         map.remove(&room_id);
     }
 
-    // Start a 30-second grace period for a room after a user disconnects.
-    pub fn start_grace_period(&self, room_id: Uuid, offline_user_id: Uuid) {
+    // Keep the disconnect deadline aligned with the configured cleanup timer.
+    pub fn start_grace_period(&self, room_id: Uuid, offline_user_id: Uuid, grace_period: Duration) {
         let mut map = self
             .grace_periods
             .write()
             .expect("ConnectionManager grace_periods lock poisoned");
-        map.insert(
-            room_id,
-            (offline_user_id, Instant::now() + Duration::from_secs(30)),
-        );
+        map.insert(room_id, (offline_user_id, Instant::now() + grace_period));
     }
 
     // Check the current grace period for a room, if any.

@@ -3,15 +3,15 @@ use crate::common::StandardResponse;
 use crate::common::error::ErrorResponse;
 use crate::common::extractor::JsonBody;
 use crate::middleware::authenticate::AuthenticatedUser;
+use crate::user::verify_password;
 use axum::Extension;
 use axum::extract::State;
 use axum::http::StatusCode;
-use bcrypt::verify;
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 #[derive(Debug, Deserialize)]
 pub struct DeleteAccountRequest {
@@ -39,10 +39,7 @@ pub async fn delete_account(
         .ok_or(ErrorResponse::NotFound("User not found.".to_string()))?
         .get::<String, _>("password");
 
-    if !verify(&request.password, &stored_hash).map_err(|error| {
-        error!("Password verification failed: {}", error);
-        ErrorResponse::InternalError("Failed to verify password.".to_string())
-    })? {
+    if !verify_password(request.password, stored_hash).await? {
         return Err(ErrorResponse::Authentication(
             "Password is incorrect.".to_string(),
         ));

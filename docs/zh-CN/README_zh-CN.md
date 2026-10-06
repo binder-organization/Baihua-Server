@@ -2,7 +2,7 @@
 
 [![Author: Gavin Zheng](https://img.shields.io/badge/Author-Gavin_Zheng-f2f28d)](https://github.com/GavZheng)
 ![Language: Rust](https://img.shields.io/badge/Language-Rust-orange)
-![Version: 0.1.4](https://img.shields.io/badge/Version-0.1.4-blue)
+![Version: 0.1.5](https://img.shields.io/badge/Version-0.1.5-blue)
 ![License: Apache v2](https://img.shields.io/badge/License-Apache%20v2-green)
 ![Github Stars](https://img.shields.io/github/stars/Binder-organize/Baihua-Server?style=flat&color=red)
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-3.0-4baaaa.svg)](CODE_OF_CONDUCT_zh-CN.md)
@@ -67,36 +67,113 @@ python3 tests/run_tests.py
 
 ```bash
 # 1. 准备生产环境变量
-# 从规范模板创建，填入你的生产密钥：
-cp .env.example .env.production
-# 然后编辑 .env.production，修改数据库密码、JWT 密钥等
+cp .env.production.example .env.production
+# 然后编辑 .env.production，填入你的生产配置。
 
 # 2. 构建并启动所有服务（首次构建可能需要 10-15 分钟）
 docker compose --env-file .env.production --profile production up -d --build
 ```
 
 > 首次构建需要在 Docker 里从零下载并编译所有 Rust 依赖。
-> 后续构建由于 Docker 层缓存会快得多。
-> 如需查看构建进度，去掉 `-d` 参数：`docker compose --profile production up --build`。
+> 后续构建耗时取决于哪些构建层仍可使用缓存。
+> 如需查看构建进度，去掉 `-d` 参数：`docker compose --env-file .env.production --profile production up --build`。
+
+公开部署前，请先检查这些事项：
+
+- 部署主机已经安装 Docker 和 Docker Compose。
+- `BAIHUA_DOMAIN` 指向部署主机后，再启动公开访问配置。
+- 使用公开访问配置时，允许外部访问 80 和 443 端口。
+- 将 `POSTGRES_PASSWORD` 和 `JWT_SECRET` 替换为强随机值。
+- 不要将 `.env.production` 提交到版本控制。
+- 升级前备份数据库和头像数据卷。
 
 启动后包含两个服务：
 
 | 服务           | 容器名               | 端口       |
 |--------------|-------------------|----------|
-| **database** | `baihua-database` | 2423（映射） |
-| **server**   | `baihua-server`   | 2424     |
+| **database** | `baihua-database` | 2423（仅本机） |
+| **server**   | `baihua-server`   | 2424（仅本机） |
+
+数据库记录保存在 `baihua-postgres-data` 卷，上传的头像保存在 `baihua-avatar-data` 卷。两个端口默认只允许部署主机访问。
+
+如需公开访问，在 `.env.production` 中将 `BAIHUA_DOMAIN` 设为指向此主机的域名，允许外部连接端口 80 和 443，再启动可选反向代理：
+
+```bash
+docker compose --env-file .env.production --profile production --profile public up -d --build
+```
+
+反向代理转发 WebSocket 连接并管理加密证书，证书状态保存在 `baihua-caddy-data` 卷。
+
+如果你已经使用其他反向代理、负载均衡或入口控制器，请不要启用公开访问配置。只启动生产配置，并让现有代理转发到部署主机的 `127.0.0.1:2424`。同时确认它会转发 WebSocket 升级请求。
 
 服务端依赖数据库健康检查才启动，并自带 Docker HEALTHCHECK（`GET /health`）。查看日志：
 
 ```bash
-docker compose --profile production logs -f
+docker compose --env-file .env.production --profile production --profile public logs -f
 ```
 
-停止并清理：
+停止服务并保留数据库、头像及证书数据卷：
 
 ```bash
-docker compose --profile production down -v
+docker compose --env-file .env.production --profile production --profile public down
 ```
+
+### 升级已有部署
+
+先备份生产数据，再更新仓库并重新构建容器：
+
+```bash
+git pull
+docker compose --env-file .env.production --profile production --profile public up -d --build
+```
+
+服务端启动时会自动执行数据库迁移。升级后检查服务健康状态并查看最近日志：
+
+```bash
+curl -fsS http://127.0.0.1:2424/health
+docker compose --env-file .env.production --profile production --profile public logs --tail=100
+```
+
+如果没有使用公开访问配置，请从升级和日志命令中去掉 `--profile public`。
+
+### 备份与恢复
+
+在维护窗口中先停止服务端，再一起备份数据库与头像，避免备份期间的头像上传造成数据不一致。备份结束后重新启动服务端；命令失败时也要重新启动。将备份目录复制到另一台主机的受保护存储中：
+
+```bash
+umask 077
+backup_directory="backups/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$backup_directory"
+docker compose --env-file .env.production --profile production stop server
+docker compose --env-file .env.production exec -T database sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$backup_directory/database.dump"
+docker run --rm --mount type=volume,src=baihua-avatar-data,dst=/avatars,readonly --mount "type=bind,src=$PWD/$backup_directory,dst=/backups" alpine tar -C /avatars -cf /backups/avatars.tar .
+docker compose --env-file .env.production --profile production start server
+```
+
+公开访问启用时，还应将证书状态备份到同一个目录：
+
+```bash
+docker run --rm --mount type=volume,src=baihua-caddy-data,dst=/caddy-data,readonly --mount "type=bind,src=$PWD/$backup_directory,dst=/backups" alpine tar -C /caddy-data -cf /backups/caddy-data.tar .
+```
+
+恢复时使用全新的空数据库与空数据卷。选择已有备份目录，先只启动数据库，再恢复数据库和头像，最后启动服务端：
+
+```bash
+backup_directory=backups/SELECTED_BACKUP_DIRECTORY
+docker compose --env-file .env.production up -d --wait database
+docker compose --env-file .env.production exec -T database sh -c 'pg_restore --exit-on-error --no-owner -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < "$backup_directory/database.dump"
+docker run --rm --mount type=volume,src=baihua-avatar-data,dst=/avatars --mount "type=bind,src=$PWD/$backup_directory,dst=/backups,readonly" alpine tar -C /avatars -xf /backups/avatars.tar
+docker compose --env-file .env.production --profile production up -d server
+```
+
+如果备份中包含 `caddy-data.tar`，将它恢复到空的证书数据卷，然后启动公开访问配置：
+
+```bash
+docker run --rm --mount type=volume,src=baihua-caddy-data,dst=/caddy-data --mount "type=bind,src=$PWD/$backup_directory,dst=/backups,readonly" alpine tar -C /caddy-data -xf /backups/caddy-data.tar
+docker compose --env-file .env.production --profile production --profile public up -d reverse-proxy
+```
+
+每次恢复演练后，检查服务健康状态、用已有账号登录，并获取一次已上传头像。恢复到已有部署前先停止服务端，不要覆盖运行中的数据库。安全保存 `.env.production` 和自定义配置。
 
 ---
 

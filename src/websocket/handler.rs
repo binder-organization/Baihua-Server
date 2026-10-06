@@ -11,7 +11,7 @@ use axum::response::IntoResponse;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast::error::RecvError;
@@ -160,8 +160,8 @@ async fn handle_socket(
         }
     }
 
-    // Track which rooms this connection is subscribed to.
-    let mut subscribed_rooms: HashSet<Uuid> = HashSet::new();
+    // Track which rooms this connection is subscribed to (room_id -> subscription_id).
+    let mut subscribed_rooms: HashMap<Uuid, Uuid> = HashMap::new();
 
     // Auto-subscribe: connect → immediately subscribe to all rooms.
     for &room_id in &user_room_ids {
@@ -295,8 +295,9 @@ async fn handle_socket(
     }
 
     // Cleanup: cancel all room subscriptions to clean up ConnectionManager.subs.
-    for &room_id in &subscribed_rooms {
-        manager.cancel_subscription(user.id, room_id);
+    // Use cancel_stale_subscription so only this connection's forward tasks exit.
+    for (&room_id, &subscription_id) in &subscribed_rooms {
+        manager.cancel_stale_subscription(user.id, room_id, subscription_id);
     }
 
     let fully_offline = manager.user_disconnected(user.id);
@@ -321,21 +322,21 @@ async fn handle_socket(
 // Subscribe a connection to a room's broadcast channel.
 // Spawns a background task that forwards messages from the room's
 // broadcast channel to the connection's internal message channel.
-// The task exits automatically when the user leaves the room
-// (via `ConnectionManager::cancel_subscription`).
+// The task exits when the cancel signal fires (user left/kicked) or the
+// connection closes.
 fn subscribe_to_room(
     user_id: Uuid,
     room_id: Uuid,
     state: &Arc<ServerState>,
     msg_tx: &mpsc::UnboundedSender<String>,
-    subscribed_rooms: &mut HashSet<Uuid>,
+    subscribed_rooms: &mut HashMap<Uuid, Uuid>,
 ) {
-    if subscribed_rooms.contains(&room_id) {
+    if subscribed_rooms.contains_key(&room_id) {
         return;
     }
 
     let mut rx = state.connection_manager.subscribe(room_id);
-    let mut cancel_rx = state
+    let (mut cancel_rx, subscription_id) = state
         .connection_manager
         .register_subscription(user_id, room_id);
     let forward_tx = msg_tx.clone();
@@ -371,7 +372,7 @@ fn subscribe_to_room(
         }
     });
 
-    subscribed_rooms.insert(room_id);
+    subscribed_rooms.insert(room_id, subscription_id);
 }
 
 // Check whether a broadcast message is a typing indicator from the given user.

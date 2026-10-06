@@ -9,15 +9,57 @@ mod search;
 
 use crate::common::error::ErrorResponse;
 use crate::{ServerState, middleware};
-use bcrypt::hash;
 use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::{self, Row};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::Semaphore;
 use tracing::{error, info};
 use uuid::Uuid;
+
+static PASSWORD_COMPUTATION_LIMIT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    let parallelism = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4)
+        .min(8);
+    Arc::new(Semaphore::new(parallelism))
+});
+
+async fn run_password_computation<ResultType, Operation>(
+    operation: Operation,
+) -> Result<ResultType, ErrorResponse>
+where
+    ResultType: Send + 'static,
+    Operation: FnOnce() -> Result<ResultType, bcrypt::BcryptError> + Send + 'static,
+{
+    // Bound password work to avoid overwhelming the blocking thread pool.
+    let permit = PASSWORD_COMPUTATION_LIMIT
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|error| ErrorResponse::InternalError(error.to_string()))?;
+
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(|error| ErrorResponse::InternalError(format!("Password task failed: {error}.")))?
+    .map_err(|error| ErrorResponse::InternalError(format!("Password operation failed: {error}.")))
+}
+
+pub(crate) async fn hash_password(password: String, cost: u32) -> Result<String, ErrorResponse> {
+    run_password_computation(move || bcrypt::hash(password, cost)).await
+}
+
+pub(crate) async fn verify_password(
+    password: String,
+    stored_hash: String,
+) -> Result<bool, ErrorResponse> {
+    run_password_computation(move || bcrypt::verify(password, &stored_hash)).await
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct User {
@@ -144,9 +186,7 @@ pub async fn new_user(
     let created_at = Utc::now();
 
     // Hash password.
-    let password_hashed = hash(new_user.password, bcrypt_cost).map_err(|error| {
-        ErrorResponse::InternalError(format!("Hash password failed: {}.", error))
-    })?;
+    let password_hashed = hash_password(new_user.password, bcrypt_cost).await?;
 
     // Insert user into database.
     sqlx::query(

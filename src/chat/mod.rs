@@ -1,4 +1,5 @@
 pub(crate) mod encrypted;
+pub(crate) mod file;
 mod member;
 mod message;
 mod request;
@@ -25,7 +26,7 @@ pub(crate) fn validate_message_content(
 ) -> Result<String, ErrorResponse> {
     let sanitized: String = content
         .chars()
-        .filter(|c| !c.is_control() || *c == '\n')
+        .filter(|char| !char.is_control() || *char == '\n')
         .collect();
 
     let trimmed = sanitized.trim().to_string();
@@ -103,14 +104,15 @@ pub async fn get_member_count(pool: &PgPool, room_id: Uuid) -> Result<i64, Error
 //
 // Priority order:
 // 1. The room creator (created_by), if still a member and not the excluded user.
-// 2. The oldest remaining member by joined_at.
-//
-// Logs a warning if no eligible successor exists.
+// 2. The oldest remaining member by joined_at (excluding the leaving user).
+// 3. The oldest remaining member by joined_at (no exclusion — last-resort fallback).
+// If the room has no members left, it is deleted.
 pub async fn auto_promote_admin(
-    pool: &PgPool,
+    state: &ServerState,
     room_id: Uuid,
     excluding_user_id: Uuid,
 ) -> Result<(), ErrorResponse> {
+    let pool = &state.pool;
     // Look up the room's creator (NULL once the creator deleted the account).
     let creator_id =
         sqlx::query_scalar::<_, Option<Uuid>>("SELECT created_by FROM rooms WHERE id = $1")
@@ -118,10 +120,18 @@ pub async fn auto_promote_admin(
             .fetch_optional(pool)
             .await?;
 
-    // Priority 1: promote the room creator if eligible.
-    if let Some(Some(creator)) = creator_id
+    // Room does not exist.
+    let Some(creator_option) = creator_id else {
+        warn!("Room {} does not exist, skipping admin promotion.", room_id);
+        return Ok(());
+    };
+
+    // Room exists, but the creator has deleted their account (created_by is NULL).
+    // Fall through to Priority 2.
+    if let Some(creator) = creator_option
         && creator != excluding_user_id
     {
+        // Priority 1: promote the room creator if eligible.
         let is_member =
             sqlx::query("SELECT 1 FROM room_members WHERE room_id = $1 AND user_id = $2")
                 .bind(room_id)
@@ -141,7 +151,7 @@ pub async fn auto_promote_admin(
         }
     }
 
-    // Priority 2: fall back to the oldest remaining member.
+    // Priority 2: fall back to the oldest remaining member (excluding the leaving user).
     let successor = sqlx::query_scalar::<_, Uuid>(
         "SELECT user_id FROM room_members \
          WHERE room_id = $1 AND user_id != $2 \
@@ -159,11 +169,31 @@ pub async fn auto_promote_admin(
             .bind(user_id)
             .execute(pool)
             .await?;
+
+        return Ok(());
+    }
+
+    // Priority 3: last-resort fallback — promote the oldest member without exclusion.
+    let fallback = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM room_members \
+         WHERE room_id = $1 \
+         ORDER BY joined_at ASC LIMIT 1",
+    )
+    .bind(room_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(user_id) = fallback {
+        sqlx::query("UPDATE room_members SET role = $1 WHERE room_id = $2 AND user_id = $3")
+            .bind(ROLE_ADMIN)
+            .bind(room_id)
+            .bind(user_id)
+            .execute(pool)
+            .await?;
     } else {
-        warn!(
-            "No eligible successor to promote in room {} after excluding user {}",
-            room_id, excluding_user_id
-        );
+        // No members left — delete the room.
+        warn!("Room {} has no members left, deleting.", room_id);
+        file::delete_room_with_files(state, room_id).await?;
     }
 
     Ok(())
@@ -203,6 +233,14 @@ pub fn router(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
             axum::routing::delete(member::remove_member),
         )
         .route("/rooms/{room_id}/messages", get(message::get_messages))
+        .route(
+            "/rooms/{room_id}/files",
+            post(file::upload_file).layer(file::upload_body_limit_layer(&state)),
+        )
+        .route(
+            "/rooms/{room_id}/files/{message_id}",
+            get(file::download_file),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state,
             crate::middleware::authenticate::authenticate,

@@ -25,6 +25,13 @@ pub async fn get_messages(
     Path(room_id): Path<Uuid>,
     Query(params): Query<GetMessagesQuery>,
 ) -> Result<StandardResponse, ErrorResponse> {
+    let limit = params.limit.unwrap_or(50).min(100);
+    if limit < 1 {
+        return Err(ErrorResponse::Validation(
+            "Message page limit must be at least 1.".to_string(),
+        ));
+    }
+
     find_room_by_id(&state.pool, room_id).await?;
 
     if !is_room_member(&state.pool, room_id, auth_user.user_id).await? {
@@ -38,8 +45,6 @@ pub async fn get_messages(
         .fetch_one(&state.pool)
         .await?;
 
-    let limit = params.limit.unwrap_or(50).min(100);
-
     // Keyset pagination: use (created_at, id) composite to guarantee deterministic ordering
     // even when two messages share the same created_at timestamp.
     // For encrypted rooms, select encrypted_content as base64 instead of plaintext content.
@@ -50,14 +55,16 @@ pub async fn get_messages(
         "content"
     };
 
-    let query = format!("SELECT id, room_id, sender_id, {content_expr}, created_at FROM messages");
+    let query = format!(
+        "SELECT messages.id, messages.room_id, messages.sender_id, {content_expr}, messages.created_at, file_attachments.content_hash, file_attachments.original_name, file_attachments.media_type, file_attachments.byte_size, file_attachments.encrypted, file_attachments.encrypted_metadata FROM messages LEFT JOIN file_attachments ON file_attachments.message_id = messages.id"
+    );
 
     let rows = if let Some(before_id) = params.before {
         let q = format!(
             "{query} \
              WHERE room_id = $1 \
-               AND (created_at, id) < (SELECT created_at, id FROM messages WHERE id = $2) \
-             ORDER BY created_at DESC, id DESC LIMIT $3",
+               AND (messages.created_at, messages.id) < (SELECT created_at, id FROM messages WHERE id = $2 AND room_id = $1) \
+             ORDER BY messages.created_at DESC, messages.id DESC LIMIT $3",
         );
         sqlx::query(&q)
             .bind(room_id)
@@ -69,7 +76,7 @@ pub async fn get_messages(
         let q = format!(
             "{query} \
              WHERE room_id = $1 \
-             ORDER BY created_at DESC, id DESC LIMIT $2",
+             ORDER BY messages.created_at DESC, messages.id DESC LIMIT $2",
         );
         sqlx::query(&q)
             .bind(room_id)
@@ -88,11 +95,21 @@ pub async fn get_messages(
             } else {
                 "content"
             };
+            let file = row.get::<Option<String>, _>("content_hash").map(|hash| json!({
+                "sha256": hash.trim(),
+                "name": row.get::<String, _>("original_name"),
+                "media_type": row.get::<String, _>("media_type"),
+                "byte_size": row.get::<i64, _>("byte_size"),
+                "encrypted": row.get::<bool, _>("encrypted"),
+                "encrypted_metadata": row.get::<Option<String>, _>("encrypted_metadata"),
+                "download_url": format!("/api/v1/chat/rooms/{room_id}/files/{}", row.get::<Uuid, _>("id")),
+            }));
             json!({
                 "id": row.get::<Uuid, _>("id"),
                 "room_id": row.get::<Uuid, _>("room_id"),
                 "sender_id": row.get::<Option<Uuid>, _>("sender_id"),
                 content_key: row.get::<Option<String>, _>("content"),
+                "file": file,
                 "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339(),
             })
         })

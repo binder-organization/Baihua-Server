@@ -49,6 +49,14 @@ pub(crate) async fn handle_encrypt_request(
         .await?
         .ok_or(ErrorResponse::NotFound("Room not found.".to_string()))?;
 
+    // Check room is not already in an active encrypted session.
+    if state.connection_manager.is_session_active(room_id) {
+        return Err(ErrorResponse::Conflict(
+            "Room already has an active encrypted session.".to_string(),
+        ));
+    }
+
+    // todo Add this feature to the group.
     if room.get("is_group") {
         return Err(ErrorResponse::BadRequest(
             "Encrypted chat is only supported in private rooms.".to_string(),
@@ -59,13 +67,6 @@ pub(crate) async fn handle_encrypt_request(
     if !crate::chat::is_room_member(&state.pool, room_id, user.id).await? {
         return Err(ErrorResponse::Forbidden(
             "You are not a member of this room.".to_string(),
-        ));
-    }
-
-    // Check room is not already in an active encrypted session.
-    if state.connection_manager.is_session_active(room_id) {
-        return Err(ErrorResponse::Conflict(
-            "Room already has an active encrypted session.".to_string(),
         ));
     }
 
@@ -158,7 +159,7 @@ pub(crate) async fn handle_encrypt_accept(
         ));
     }
 
-    // Clear pending state (accept is being processed).
+    // Clear pending state.
     state.connection_manager.clear_pending(room_id);
 
     // Forward acceptance to the room.
@@ -178,7 +179,7 @@ pub(crate) async fn handle_encrypt_accept(
     Ok(None)
 }
 
-// Phase 3: Each side confirms ready. Activate when both have signalled.
+// Phase 3: Each side confirms ready. Activate when both have signaled.
 pub(crate) async fn handle_encrypt_ready(
     state: &Arc<ServerState>,
     user: &User,
@@ -374,11 +375,13 @@ pub(crate) async fn start_grace_periods_for_user(
             continue;
         }
 
+        let grace_period =
+            Duration::from_secs(state.configuration.websocket.encrypted_grace_period_secs);
         state
             .connection_manager
-            .start_grace_period(room_id, user_id);
+            .start_grace_period(room_id, user_id, grace_period);
 
-        let grace_until = (Utc::now() + Duration::from_secs(30)).to_rfc3339();
+        let grace_until = (Utc::now() + grace_period).to_rfc3339();
         let msg = json!({
             "type": "encrypt_partner_disconnected",
             "data": {
@@ -398,14 +401,17 @@ pub(crate) async fn start_grace_periods_for_user(
     }
 }
 
-// Wait 30 seconds, then terminate if the user hasn't reconnected.
+// Delay cleanup until the configured reconnect grace period has passed.
 async fn grace_period_waiter(
     state: Arc<ServerState>,
     room_id: Uuid,
     offline_user_id: Uuid,
     pool: PgPool,
 ) {
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_secs(
+        state.configuration.websocket.encrypted_grace_period_secs,
+    ))
+    .await;
 
     // Check if the grace period is still active for this user+room.
     // If the user reconnected, cancel_grace_periods_for_user would have
@@ -428,25 +434,63 @@ pub(crate) async fn cleanup_encrypted_room(
     offline_user_id: Option<Uuid>,
     pool: &PgPool,
 ) {
-    // Delete all messages (both encrypted and plaintext — room is being reset).
+    let mut transaction = match pool.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            error!(
+                "Failed to begin encrypted room cleanup for {}: {}",
+                room_id, error
+            );
+            return;
+        }
+    };
+    if let Err(error) = sqlx::query("SELECT 1 FROM rooms WHERE id = $1 FOR UPDATE")
+        .bind(room_id)
+        .fetch_optional(&mut *transaction)
+        .await
+    {
+        error!("Failed to lock encrypted room {}: {}", room_id, error);
+        return;
+    }
+    let hashes = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT file_attachments.content_hash FROM file_attachments JOIN messages ON messages.id = file_attachments.message_id WHERE messages.room_id = $1",
+    ).bind(room_id).fetch_all(&mut *transaction).await;
+    let hashes = match hashes {
+        Ok(hashes) => hashes,
+        Err(error) => {
+            error!("Failed to list files for room {}: {}", room_id, error);
+            return;
+        }
+    };
     if let Err(error) = sqlx::query("DELETE FROM messages WHERE room_id = $1")
         .bind(room_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
     {
         error!("Failed to delete messages for room {}: {}", room_id, error);
+        return;
     }
-
     // Reset room encryption status.
     if let Err(error) = sqlx::query("UPDATE rooms SET is_encrypted = false WHERE id = $1")
         .bind(room_id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
     {
         error!(
             "Failed to reset room encryption status for {}: {}",
             room_id, error
         );
+        return;
+    }
+    if let Err(error) = transaction.commit().await {
+        error!(
+            "Failed to commit encrypted room cleanup for {}: {}",
+            room_id, error
+        );
+        return;
+    }
+    if let Err(error) = crate::chat::file::delete_unreferenced_files(state, hashes).await {
+        error!("Failed to clean files for room {}: {}", room_id, error);
     }
 
     // Clear in-memory state.
@@ -454,7 +498,6 @@ pub(crate) async fn cleanup_encrypted_room(
     state.connection_manager.clear_pending(room_id);
     state.connection_manager.remove_ready_state(room_id);
     state.connection_manager.cancel_grace_period(room_id);
-
     // Notify participants.
     let reason = if terminated_by.is_some() {
         "user_left"

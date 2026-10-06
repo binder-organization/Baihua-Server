@@ -32,6 +32,7 @@ import os
 import uuid
 
 import psycopg2
+import pytest
 import requests
 
 
@@ -223,6 +224,7 @@ class RoomRequestChatTest:
 
     # ── R5 ────────────────────────────────────────────────────────────
 
+    @pytest.mark.smoke
     def test_send_request_happy_path(
         self, session: requests.Session, base_url: str
     ) -> None:

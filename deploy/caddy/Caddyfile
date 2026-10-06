@@ -1,0 +1,3 @@
+{$BAIHUA_DOMAIN} {
+    reverse_proxy server:2424
+}

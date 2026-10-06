@@ -84,7 +84,8 @@ python3 tests/run_tests.py
 # Full Docker mode (like CI): builds and runs everything in containers
 python3 tests/run_tests.py --docker
 
-# Local PostgreSQL mode: use an existing local PostgreSQL
+# Local PostgreSQL mode: provide POSTGRES_HOST, POSTGRES_PORT,
+# POSTGRES_USER, POSTGRES_PASSWORD, and a dedicated baihua_test_ database
 python3 tests/run_tests.py --local
 ```
 
@@ -99,6 +100,11 @@ To keep the server running after tests (e.g. for manual testing):
 ```bash
 python3 tests/run_tests.py --keep
 ```
+
+The runner creates a unique Docker Compose project and database for each run.
+Local mode requires an explicitly named test database and never selects an
+existing application database automatically. Run a small subset with
+`--smoke`, or repeat `--test` to select individual test paths or cases.
 
 ### CI Pipeline
 

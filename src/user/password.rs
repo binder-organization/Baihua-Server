@@ -3,15 +3,15 @@ use crate::common::StandardResponse;
 use crate::common::error::ErrorResponse;
 use crate::common::extractor::JsonBody;
 use crate::middleware::authenticate::AuthenticatedUser;
+use crate::user::{hash_password, verify_password};
 use axum::Extension;
 use axum::extract::State;
 use axum::http::StatusCode;
-use bcrypt::{hash, verify};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::info;
 
 #[derive(Debug, Deserialize)]
 pub struct ChangePasswordRequest {
@@ -39,19 +39,14 @@ pub async fn change_password(
         .ok_or(ErrorResponse::NotFound("User not found.".to_string()))?
         .get::<String, _>("password");
 
-    if !verify(&request.old_password, &stored_hash).map_err(|error| {
-        error!("Password verification failed: {}", error);
-        ErrorResponse::InternalError("Failed to verify old password.".to_string())
-    })? {
+    if !verify_password(request.old_password, stored_hash).await? {
         return Err(ErrorResponse::Authentication(
             "Old password is incorrect.".to_string(),
         ));
     }
 
     let new_hash =
-        hash(request.new_password, state.configuration.user.bcrypt_cost).map_err(|error| {
-            ErrorResponse::InternalError(format!("Hash password failed: {}.", error))
-        })?;
+        hash_password(request.new_password, state.configuration.user.bcrypt_cost).await?;
 
     // Bump token_version so every previously issued JWT (other devices
     // included) stops passing the version check.

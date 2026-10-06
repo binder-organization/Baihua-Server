@@ -5,7 +5,7 @@ use crate::common::extractor::JsonBody;
 use crate::middleware::authenticate::AuthenticatedUser;
 use crate::user::find_user_by_username;
 use axum::Extension;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -419,36 +419,67 @@ pub async fn get_room_detail(
     ))
 }
 
-// List all rooms the authenticated user is a member of.
-// Uses two queries: one for room metadata + last message, one for member UUIDs.
+#[derive(Debug, Deserialize)]
+pub struct ListRoomsQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+// Keep the expensive room details within the requested page.
 pub async fn list_rooms(
     State(state): State<Arc<ServerState>>,
     Extension(auth_user): Extension<AuthenticatedUser>,
+    Query(params): Query<ListRoomsQuery>,
 ) -> Result<StandardResponse, ErrorResponse> {
-    // Query 1: rooms the user belongs to, with member count and last message preview.
-    let room_rows = sqlx::query(
-        "SELECT r.id, r.name, r.created_by, r.created_at, r.is_group, r.is_encrypted, rm.role, \
+    let limit = params.limit.unwrap_or(50);
+    let offset = params.offset.unwrap_or(0);
+    if !(1..=100).contains(&limit) {
+        return Err(ErrorResponse::Validation(
+            "Room page limit must be between 1 and 100.".to_string(),
+        ));
+    }
+    if offset < 0 {
+        return Err(ErrorResponse::Validation(
+            "Room page offset cannot be negative.".to_string(),
+        ));
+    }
+
+    let mut room_rows = sqlx::query(
+        "SELECT r.id, r.name, r.created_by, r.created_at, r.is_group, r.is_encrypted, r.role, \
                 mc.cnt AS member_count, \
                 lm.msg_id AS last_msg_id, lm.content AS last_msg_content, \
                 lm.created_at AS last_msg_created_at, lm.sender_username AS last_msg_sender_username \
-         FROM rooms r \
-         INNER JOIN room_members rm ON r.id = rm.room_id AND rm.user_id = $1 \
+         FROM ( \
+             SELECT rooms.id, rooms.name, rooms.created_by, rooms.created_at, \
+                    rooms.is_group, rooms.is_encrypted, room_members.role \
+             FROM rooms \
+             INNER JOIN room_members ON rooms.id = room_members.room_id \
+             WHERE room_members.user_id = $1 \
+             ORDER BY rooms.created_at DESC, rooms.id DESC \
+             LIMIT $2 OFFSET $3 \
+         ) r \
          LEFT JOIN LATERAL ( \
              SELECT COUNT(*) AS cnt FROM room_members WHERE room_id = r.id \
          ) mc ON true \
          LEFT JOIN LATERAL ( \
-             SELECT m.id AS msg_id, m.content, m.created_at, u.username AS sender_username \
+             SELECT m.id AS msg_id, COALESCE(m.content, 'File: ' || f.original_name) AS content, m.created_at, u.username AS sender_username \
              FROM messages m \
              LEFT JOIN users u ON m.sender_id = u.id \
+             LEFT JOIN file_attachments f ON f.message_id = m.id \
              WHERE m.room_id = r.id \
              ORDER BY m.created_at DESC, m.id DESC \
              LIMIT 1 \
          ) lm ON true \
-         ORDER BY r.created_at DESC",
+         ORDER BY r.created_at DESC, r.id DESC",
     )
     .bind(auth_user.user_id)
+    .bind(limit + 1)
+    .bind(offset)
     .fetch_all(&state.pool)
     .await?;
+
+    let has_more = room_rows.len() > limit as usize;
+    room_rows.truncate(limit as usize);
 
     // Collect room IDs for the member UUID query.
     let room_ids: Vec<Uuid> = room_rows.iter().map(|r| r.get("id")).collect();
@@ -510,6 +541,11 @@ pub async fn list_rooms(
     Ok(StandardResponse::success(
         StatusCode::OK,
         "Rooms listed successfully.".to_string(),
-        json!({ "rooms": rooms }),
+        json!({
+            "rooms": rooms,
+            "has_more": has_more,
+            "limit": limit,
+            "offset": offset,
+        }),
     ))
 }

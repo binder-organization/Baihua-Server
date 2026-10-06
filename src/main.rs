@@ -18,6 +18,7 @@ use infrastructure::environment::Environment;
 use infrastructure::initialize;
 use middleware::rate_limit::SlidingWindowRateLimiter;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +39,9 @@ pub struct ServerState {
     pub environment: Environment,
     pub connection_manager: Arc<ConnectionManager>,
     pub avatars_directory: PathBuf,
+    pub files_directory: PathBuf,
+    pub file_uploads_directory: PathBuf,
+    pub active_file_uploads: Arc<std::sync::Mutex<HashMap<uuid::Uuid, u32>>>,
     pub(crate) login_rate_limiter: Arc<SlidingWindowRateLimiter>,
     pub(crate) register_rate_limiter: Arc<SlidingWindowRateLimiter>,
     pub(crate) shutting_down: Arc<AtomicBool>,
@@ -53,7 +57,7 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "Baihua Server - v0.1.4 ({}) by Gavin Zheng et al.",
+        "Baihua Server - v0.1.5 ({}) by Gavin Zheng et al.",
         if environment.is_production() {
             "production"
         } else {

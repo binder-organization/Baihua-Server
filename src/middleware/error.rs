@@ -4,7 +4,7 @@ use crate::common::error::ErrorResponse;
 use axum::{
     Json,
     extract::{Request, State},
-    http::StatusCode,
+    http::{Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -73,9 +73,24 @@ pub async fn payload_too_large(
     request: Request,
     next: Next,
 ) -> Response {
+    let file_upload_request = is_file_upload_request(&request);
     let response = next.run(request).await;
 
     if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        if response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|value| value.as_bytes().starts_with(b"application/json"))
+        {
+            return response;
+        }
+        if file_upload_request {
+            return ErrorResponse::PayloadTooLarge(format!(
+                "The file upload request exceeds the maximum allowed size of {} bytes.",
+                state.configuration.file.max_bytes
+            ))
+            .into_response();
+        }
         return ErrorResponse::PayloadTooLarge(format!(
             "The request body exceeds the maximum allowed size of {} bytes.",
             state.configuration.web.max_body_size
@@ -93,6 +108,9 @@ pub async fn request_timeout(
     request: Request,
     next: Next,
 ) -> Response {
+    if is_file_upload_request(&request) {
+        return next.run(request).await;
+    }
     let deadline = tokio::time::Duration::from_secs(state.configuration.web.request_timeout_secs);
 
     match tokio::time::timeout(deadline, next.run(request)).await {
@@ -103,6 +121,22 @@ pub async fn request_timeout(
         ))
         .into_response(),
     }
+}
+
+fn is_file_upload_request(request: &Request) -> bool {
+    if request.method() != Method::POST {
+        return false;
+    }
+    let segments: Vec<_> = request
+        .uri()
+        .path()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    matches!(
+        segments.as_slice(),
+        ["api", "v1", "chat", "rooms", _, "files"] | ["chat", "rooms", _, "files"]
+    )
 }
 
 // Service unavailable(503) error handler — active during graceful shutdown.
