@@ -11,7 +11,7 @@ pub async fn greet() -> impl IntoResponse {
 
     // Modifications are required when the version is upgraded.
     let response = GreetResponse {
-        server_version: "0.1.4".to_string(),
+        server_version: "0.1.5".to_string(),
         api_version: "v1".to_string(),
         message: "Hello Baihua.".to_string(),
     };
