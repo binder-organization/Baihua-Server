@@ -2,7 +2,7 @@
 
 [![Author: Gavin Zheng](https://img.shields.io/badge/Author-Gavin_Zheng-f2f28d)](https://github.com/GavZheng)
 ![Language: Rust](https://img.shields.io/badge/Language-Rust-orange)
-![Version: 0.1.4](https://img.shields.io/badge/Version-0.1.4-blue)
+![Version: 0.1.5](https://img.shields.io/badge/Version-0.1.5-blue)
 ![License: Apache v2](https://img.shields.io/badge/License-Apache%20v2-green)
 ![Github Stars](https://img.shields.io/github/stars/Binder-organize/Baihua-Server?style=flat&color=red)
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-3.0-4baaaa.svg)](CODE_OF_CONDUCT_zh-CN.md)

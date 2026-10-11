@@ -2,6 +2,29 @@
 
 All notable changes to Baihua Server will be documented in this file.
 
+## [0.1.5] - 2026-10-06
+
+### Added
+
+- **File messages** — add authenticated file upload and download endpoints for chat rooms, with streamed uploads, SHA-256 verification, per-user storage quotas, concurrent upload limits, content deduplication, and automatic cleanup when message references are removed.
+- **Encrypted file messages** — allow encrypted private chat sessions to relay encrypted file bytes and encrypted metadata without exposing plaintext file contents to the server.
+- **Public deployment profile** — add an optional reverse proxy profile with automatic certificate management for deployments that expose the server publicly.
+- **Backup and restore guidance** — document coordinated backups and restores for the database, avatars, file messages, and certificate state.
+
+### Changed
+
+- **Room listing pagination** — add `limit`, `offset`, and `has_more` fields to room listing responses and validate pagination values.
+- **Message and user search pagination validation** — reject non-positive page limits with a validation error instead of silently accepting invalid values.
+- **Encrypted session configuration** — make the encrypted session disconnect grace period configurable through the profile configuration and environment variables.
+- **Container startup** — prepare persistent storage directories with least-privilege ownership and fail safely when mounted paths are not writable by the service user.
+- **Runtime and test infrastructure** — improve server throughput, isolate integration test resources, add file message coverage, and add development console commands for debugging and restart control.
+
+### Fixed
+
+- **WebSocket delivery races** — prevent disconnect cleanup and multi-connection broadcast handling from losing messages during reconnection or concurrent connection changes.
+- **File cleanup** — reclaim uploaded file data when validation, database insertion, room cleanup, or encrypted session termination removes the final reference.
+- **Upload limits** — enforce file size, request idle timeout, quota, and concurrent upload limits while streaming request bodies.
+
 ## [0.1.4] - 2026-08-21
 
 ### Breaking Changes
