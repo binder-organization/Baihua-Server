@@ -32,3 +32,16 @@ jobs:
 
       - name: clippy
         run: cargo clippy --locked -- -D warnings
+
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: review dependencies
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
