@@ -2,6 +2,9 @@
 name = "baihua-server"
 version = "0.1.5"
 edition = "2024"
+authors = ["Gavin Zheng"]
+license = "Apache-2.0"
+repository = "https://github.com/Binder-organize/Baihua-Server"
 
 [dependencies]
 axum = {version = "0.8.8", features = ["macros", "ws", "multipart"]}
