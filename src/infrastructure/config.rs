@@ -24,10 +24,16 @@ pub struct ServerConfiguration {
 pub struct WebConfiguration {
     pub host: String,
     pub port: u16,
+    #[serde(default = "default_require_encrypted_transport")]
+    pub require_encrypted_transport: bool,
     #[serde(default = "default_max_body_size")]
     pub max_body_size: u32,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+}
+
+fn default_require_encrypted_transport() -> bool {
+    true
 }
 
 // Log configuration
@@ -320,6 +326,7 @@ impl Default for ServerConfiguration {
             web: WebConfiguration {
                 host: "127.0.0.1".to_string(),
                 port: 2424,
+                require_encrypted_transport: default_require_encrypted_transport(),
                 max_body_size: default_max_body_size(),
                 request_timeout_secs: default_request_timeout_secs(),
             },
@@ -366,6 +373,8 @@ host = "127.0.0.1"
 # The TCP port the server listens on for incoming HTTP and WebSocket
 # connections. Must be between 1 and 65535.
 port = 2424
+
+require_encrypted_transport = true
 
 # The maximum size of a request body in bytes.
 # When omitted, defaults to 10485760 (10 MB).

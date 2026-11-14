@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "Baihua Server - v0.1.5 ({}) by Gavin Zheng",
+        "Baihua Server - v0.2.0-develop ({}) by Gavin Zheng",
         if environment.is_production() {
             "production"
         } else {

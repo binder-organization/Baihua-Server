@@ -1,3 +1,9 @@
-{$BAIHUA_DOMAIN} {
+{$BAIHUA_DOMAIN}:2424 {
+    tls {
+        issuer acme {
+            disable_tlsalpn_challenge
+        }
+    }
+
     reverse_proxy server:2424
 }

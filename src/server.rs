@@ -48,6 +48,10 @@ pub async fn server(
             state.clone(),
             middleware::error::service_unavailable,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::encrypted_transport::enforce_encrypted_transport,
+        ))
         .layer(DefaultBodyLimit::max(
             state.configuration.web.max_body_size as usize,
         ))

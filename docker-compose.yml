@@ -22,14 +22,13 @@ services:
       - production
     build: .
     container_name: baihua-server
-    ports:
-      - "127.0.0.1:2424:2424"
     volumes:
       - avatars:/app/.baihua/avatars
       - files:/app/.baihua/files
     environment:
       BAIHUA_ENV: production
       BAIHUA_DIR: /app/.baihua
+      BAIHUA_REQUIRE_ENCRYPTED_TRANSPORT: ${BAIHUA_REQUIRE_ENCRYPTED_TRANSPORT:-true}
       BIND_HOST: "0.0.0.0"
       JWT_SECRET: ${JWT_SECRET}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -40,24 +39,21 @@ services:
     depends_on:
       database:
         condition: service_healthy
+      reverse-proxy:
+        condition: service_started
     restart: always
 
   reverse-proxy:
-    profiles:
-      - public
     image: caddy:2.11.6
     ports:
       - "80:80"
-      - "443:443"
+      - "2424:2424"
     environment:
       BAIHUA_DOMAIN: ${BAIHUA_DOMAIN:-localhost}
     volumes:
       - ./deploy/caddy:/etc/caddy:ro
       - caddy_data:/data
       - caddy_config:/config
-    depends_on:
-      server:
-        condition: service_healthy
     restart: unless-stopped
 
 volumes:

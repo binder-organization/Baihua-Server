@@ -81,41 +81,44 @@ docker compose --env-file .env.production --profile production up -d --build
 公开部署前，请先检查这些事项：
 
 - 部署主机已经安装 Docker 和 Docker Compose。
-- `BAIHUA_DOMAIN` 指向部署主机后，再启动公开访问配置。
-- 使用公开访问配置时，允许外部访问 80 和 443 端口。
+- 将 `BAIHUA_DOMAIN` 指向部署主机。
+- 允许外部访问 80 和 2424 端口。80 端口仅用于证书验证和跳转；客户端通过 2424 端口建立加密连接。
 - 将 `POSTGRES_PASSWORD` 和 `JWT_SECRET` 替换为强随机值。
 - 不要将 `.env.production` 提交到版本控制。
 - 升级前备份数据库和头像数据卷。
 
-启动后包含两个服务：
+启动后包含数据库、服务端和加密公开入口：
 
 | 服务           | 容器名               | 端口       |
 |--------------|-------------------|----------|
 | **database** | `baihua-database` | 2423（仅本机） |
-| **server**   | `baihua-server`   | 2424（仅本机） |
+| **server**   | `baihua-server`   | 仅限 Docker 内部网络 |
+| **reverse proxy** | `caddy` | 80 用于证书验证和跳转；2424 用于加密连接 |
 
-数据库记录保存在 `baihua-postgres-data` 卷，上传的头像保存在 `baihua-avatar-data` 卷。两个端口默认只允许部署主机访问。
+数据库端口只绑定到部署主机的本地地址，不会暴露到互联网。服务端没有主机端口映射，Caddy 通过 Docker 内部网络访问服务端。客户端使用 `https://BAIHUA_DOMAIN:2424` 连接；80 端口仅用于证书验证，并将访问者跳转到加密地址。WebSocket 客户端使用 `wss://BAIHUA_DOMAIN:2424/websocket` 连接。数据库记录保存在 `baihua-postgres-data` 卷，上传的头像保存在 `baihua-avatar-data` 卷。
 
-如需公开访问，在 `.env.production` 中将 `BAIHUA_DOMAIN` 设为指向此主机的域名，允许外部连接端口 80 和 443，再启动可选反向代理：
+生产环境中，服务端默认拒绝没有经过加密连接的请求。Caddy 会自动添加加密标记，并忽略客户端自行提供的同名标记。不要把服务端端口直接暴露到公网。如果使用其他反向代理，请确保它只在加密连接时将 `X-Forwarded-Proto` 设为 `https`。容器内部运行的健康检查不受此限制。默认开启这项检查；只有明确将 `.env.production` 中的 `BAIHUA_REQUIRE_ENCRYPTED_TRANSPORT` 设为 `false` 才会关闭。开发环境不执行这项检查。
+
+如需公开访问，在 `.env.production` 中将 `BAIHUA_DOMAIN` 设为指向此主机的域名，并允许外部连接端口 80 和 2424。Caddy 会随生产配置自动启动、申请并续期证书，并将未加密请求跳转到 2424 端口。服务端默认强制加密；只有确实需要接受未加密请求时，才将 `BAIHUA_REQUIRE_ENCRYPTED_TRANSPORT` 设为 `false`：
 
 ```bash
-docker compose --env-file .env.production --profile production --profile public up -d --build
+docker compose --env-file .env.production --profile production up -d --build
 ```
 
-反向代理转发 WebSocket 连接并管理加密证书，证书状态保存在 `baihua-caddy-data` 卷。
+反向代理负责管理证书和转发 WebSocket 连接，证书状态保存在 `baihua-caddy-data` 卷。服务端和数据库端口不会暴露到互联网。
 
-如果你已经使用其他反向代理、负载均衡或入口控制器，请不要启用公开访问配置。只启动生产配置，并让现有代理转发到部署主机的 `127.0.0.1:2424`。同时确认它会转发 WebSocket 升级请求。
+如果你已经使用其他反向代理、负载均衡或入口控制器，请从 Compose 部署中移除 `reverse-proxy` 服务，并让现有入口代理通过 Docker 内部网络转发到服务端。同时确认它提供加密连接并转发 WebSocket 升级请求。
 
 服务端依赖数据库健康检查才启动，并自带 Docker HEALTHCHECK（`GET /health`）。查看日志：
 
 ```bash
-docker compose --env-file .env.production --profile production --profile public logs -f
+docker compose --env-file .env.production --profile production logs -f
 ```
 
 停止服务并保留数据库、头像及证书数据卷：
 
 ```bash
-docker compose --env-file .env.production --profile production --profile public down
+docker compose --env-file .env.production --profile production down
 ```
 
 ### 升级已有部署
@@ -124,17 +127,15 @@ docker compose --env-file .env.production --profile production --profile public 
 
 ```bash
 git pull
-docker compose --env-file .env.production --profile production --profile public up -d --build
+docker compose --env-file .env.production --profile production up -d --build
 ```
 
 服务端启动时会自动执行数据库迁移。升级后检查服务健康状态并查看最近日志：
 
 ```bash
-curl -fsS http://127.0.0.1:2424/health
-docker compose --env-file .env.production --profile production --profile public logs --tail=100
+docker compose --env-file .env.production --profile production exec -T server curl -fsS http://127.0.0.1:2424/health
+docker compose --env-file .env.production --profile production logs --tail=100
 ```
-
-如果没有使用公开访问配置，请从升级和日志命令中去掉 `--profile public`。
 
 ### 备份与恢复
 
@@ -150,7 +151,7 @@ docker run --rm --mount type=volume,src=baihua-avatar-data,dst=/avatars,readonly
 docker compose --env-file .env.production --profile production start server
 ```
 
-公开访问启用时，还应将证书状态备份到同一个目录：
+还应将 Caddy 的证书状态备份到同一个目录：
 
 ```bash
 docker run --rm --mount type=volume,src=baihua-caddy-data,dst=/caddy-data,readonly --mount "type=bind,src=$PWD/$backup_directory,dst=/backups" alpine tar -C /caddy-data -cf /backups/caddy-data.tar .
@@ -166,11 +167,11 @@ docker run --rm --mount type=volume,src=baihua-avatar-data,dst=/avatars --mount 
 docker compose --env-file .env.production --profile production up -d server
 ```
 
-如果备份中包含 `caddy-data.tar`，将它恢复到空的证书数据卷，然后启动公开访问配置：
+将 `caddy-data.tar` 恢复到空的证书数据卷，然后启动公开入口：
 
 ```bash
 docker run --rm --mount type=volume,src=baihua-caddy-data,dst=/caddy-data --mount "type=bind,src=$PWD/$backup_directory,dst=/backups,readonly" alpine tar -C /caddy-data -xf /backups/caddy-data.tar
-docker compose --env-file .env.production --profile production --profile public up -d reverse-proxy
+docker compose --env-file .env.production --profile production up -d reverse-proxy
 ```
 
 每次恢复演练后，检查服务健康状态、用已有账号登录，并获取一次已上传头像。恢复到已有部署前先停止服务端，不要覆盖运行中的数据库。安全保存 `.env.production` 和自定义配置。

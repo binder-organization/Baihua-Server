@@ -37,6 +37,11 @@ pub async fn initialize(environment: Environment) -> Result<(ServerState, LogSys
             .parse()
             .context("Invalid request timeout.")?;
     }
+    if let Ok(require_encrypted_transport) = std::env::var("BAIHUA_REQUIRE_ENCRYPTED_TRANSPORT") {
+        configuration.web.require_encrypted_transport = require_encrypted_transport
+            .parse()
+            .context("Invalid encrypted transport requirement.")?;
+    }
     if let Ok(maximum_uploads) = std::env::var("BAIHUA_MAXIMUM_CONCURRENT_UPLOADS_PER_USER") {
         configuration.file.maximum_concurrent_uploads_per_user = maximum_uploads
             .parse()

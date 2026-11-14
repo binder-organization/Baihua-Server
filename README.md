@@ -84,20 +84,23 @@ docker compose --env-file .env.production --profile production up -d --build
 Before starting a public deployment, check these items:
 
 - Install Docker and Docker Compose on the deployment host.
-- Point the `BAIHUA_DOMAIN` address to the deployment host before starting the public profile.
-- Allow incoming traffic on ports 80 and 443 when the public profile is used.
+- Point `BAIHUA_DOMAIN` to the deployment host.
+- Allow incoming traffic on ports 80 and 2424. Port 80 is used for certificate verification and redirects; clients use encrypted connections on port 2424.
 - Replace `POSTGRES_PASSWORD` and `JWT_SECRET` with strong random values.
 - Keep `.env.production` outside version control.
 - Back up the database, avatar, and file volumes before upgrades.
 
-This starts two services:
+This starts the database, server, and encrypted public entry point:
 
 | Service | Container | Port |
 |---------|-----------|------|
 | **database** | `baihua-database` | 2423 (localhost only) |
-| **server** | `baihua-server` | 2424 (localhost only) |
+| **server** | `baihua-server` | Internal Docker network only |
+| **reverse proxy** | `caddy` | 80 for certificate verification and redirects; 2424 for encrypted connections |
 
-Both ports are limited to the deployment host. The database is reachable from the server over the Compose network, so it does not need a public port. Uploaded avatars are stored in the `baihua-avatar-data` volume; file message bytes are stored in `baihua-file-data`; database records are stored in `baihua-postgres-data`.
+The database port is bound to the deployment host's local address and is not exposed to the internet. The server has no host port; Caddy reaches it over the private Docker network. Clients connect to `https://BAIHUA_DOMAIN:2424`. Port 80 is used only for certificate verification and to redirect visitors to the encrypted address. WebSocket clients connect to `wss://BAIHUA_DOMAIN:2424/websocket`. Uploaded avatars are stored in the `baihua-avatar-data` volume; file message bytes are stored in `baihua-file-data`; database records are stored in `baihua-postgres-data`.
+
+In production, the server rejects requests unless its reverse proxy marks them as encrypted. Caddy adds this mark automatically and ignores any value supplied by the client. Keep the server off public host ports. If you use another reverse proxy, make sure it sets `X-Forwarded-Proto` to `https` only for encrypted connections. The health check is exempt because it runs inside the server container. This check is enabled by default; to deliberately disable it, set `BAIHUA_REQUIRE_ENCRYPTED_TRANSPORT=false` in `.env.production`. Development mode does not enforce this check.
 
 Run one server instance for each database and local file volume. File storage, active upload tracking, encrypted session state, and WebSocket connections are local to the server process. Multiple server instances require shared file storage and distributed coordination, which this version does not provide.
 
@@ -105,26 +108,26 @@ File uploads default to a 5 gibibyte limit, a 50 gibibyte logical quota for each
 
 The container entrypoint starts as root to prepare application directories, then runs the server as the `baihua` user. If a bind mount rejects ownership changes, startup continues only when that user can write to the mounted directory.
 
-To accept public traffic, set `BAIHUA_DOMAIN` in `.env.production` to a domain whose address points to this host, allow incoming connections on ports 80 and 443, and start the optional reverse proxy:
+To accept public traffic, set `BAIHUA_DOMAIN` in `.env.production` to a domain whose address points to this host. Caddy starts automatically with the production profile, obtains and renews the certificate, and redirects unencrypted requests to port 2424. Encrypted transport is enforced by default; set `BAIHUA_REQUIRE_ENCRYPTED_TRANSPORT=false` only if you deliberately need the server to accept unencrypted requests. Allow incoming connections on ports 80 and 2424:
 
 ```bash
-docker compose --env-file .env.production --profile production --profile public up -d --build
+docker compose --env-file .env.production --profile production up -d --build
 ```
 
-The reverse proxy manages encrypted certificates and forwards WebSocket connections. Its certificate state is stored in `baihua-caddy-data`; preserve this volume during updates. Without the public profile, the service remains available only on the deployment host.
+The reverse proxy manages certificates and forwards WebSocket connections. Its certificate state is stored in `baihua-caddy-data`; preserve this volume during updates. The server and database ports are not exposed to the internet.
 
-If you already use another reverse proxy, load balancer, or ingress controller, keep the public profile disabled. Start only the production profile and forward traffic from your existing proxy to `127.0.0.1:2424` on the deployment host. Make sure it forwards WebSocket upgrade requests to the same address.
+If you already use another reverse proxy, load balancer, or ingress controller, remove the `reverse-proxy` service from the Compose deployment and configure your existing entry point to forward traffic to the server on the private Docker network. Make sure it provides encrypted connections and forwards WebSocket upgrade requests.
 
 The server is gated by the database health check and includes a Docker HEALTHCHECK (`GET /health`). Logs:
 
 ```bash
-docker compose --env-file .env.production --profile production --profile public logs -f
+docker compose --env-file .env.production --profile production logs -f
 ```
 
 To stop the stack while keeping database records, uploaded avatars, file message bytes, and certificates:
 
 ```bash
-docker compose --env-file .env.production --profile production --profile public down
+docker compose --env-file .env.production --profile production down
 ```
 
 ### Upgrade an existing deployment
@@ -133,17 +136,15 @@ Back up production data first, then update the repository and rebuild the contai
 
 ```bash
 git pull
-docker compose --env-file .env.production --profile production --profile public up -d --build
+docker compose --env-file .env.production --profile production up -d --build
 ```
 
 The server runs database migrations during startup. After the upgrade, check service health and inspect recent logs:
 
 ```bash
-curl -fsS http://127.0.0.1:2424/health
-docker compose --env-file .env.production --profile production --profile public logs --tail=100
+docker compose --env-file .env.production --profile production exec -T server curl -fsS http://127.0.0.1:2424/health
+docker compose --env-file .env.production --profile production logs --tail=100
 ```
-
-If you do not use the public profile, omit `--profile public` from the upgrade and log commands.
 
 ### Back up and restore production data
 
@@ -160,7 +161,7 @@ docker run --rm --mount type=volume,src=baihua-file-data,dst=/files,readonly --m
 docker compose --env-file .env.production --profile production start server
 ```
 
-If the public reverse proxy is enabled, also back up its certificate state into the same directory:
+Back up Caddy's certificate state into the same directory:
 
 ```bash
 docker run --rm --mount type=volume,src=baihua-caddy-data,dst=/caddy-data,readonly --mount "type=bind,src=$PWD/$backup_directory,dst=/backups" alpine tar -C /caddy-data -cf /backups/caddy-data.tar .
@@ -177,11 +178,11 @@ docker run --rm --mount type=volume,src=baihua-file-data,dst=/files --mount "typ
 docker compose --env-file .env.production --profile production up -d server
 ```
 
-If the backup includes `caddy-data.tar`, restore it to the empty certificate volume and then start the public profile:
+If the backup includes `caddy-data.tar`, restore it to the empty certificate volume and then start Caddy:
 
 ```bash
 docker run --rm --mount type=volume,src=baihua-caddy-data,dst=/caddy-data --mount "type=bind,src=$PWD/$backup_directory,dst=/backups,readonly" alpine tar -C /caddy-data -xf /backups/caddy-data.tar
-docker compose --env-file .env.production --profile production --profile public up -d reverse-proxy
+docker compose --env-file .env.production --profile production up -d reverse-proxy
 ```
 
 Check the server health, log in with an existing account, retrieve an uploaded avatar, and download a file message after each restore rehearsal. Stop the server before restoring data into an existing deployment; do not overwrite a live database.
