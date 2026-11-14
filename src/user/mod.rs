@@ -148,14 +148,7 @@ impl UserRegister {
                 "Username cannot be in UUID format.".to_string(),
             ));
         }
-
-        // Can't be mine!
-        if self.email == "gav.zheng@outlook.com" {
-            return Err(ErrorResponse::Validation(
-                "Email cannot be 'gav.zheng@outlook.com'.".to_string(),
-            ));
-        }
-
+        
         Ok(())
     }
 }
