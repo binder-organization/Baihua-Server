@@ -98,9 +98,9 @@ pub async fn create_room_request(
         ));
     }
 
-    // The receiver must exist and be active.
+    // The receiver must have access to the service.
     let receiver = sqlx::query(
-        "SELECT id FROM users WHERE id = $1 AND is_active = true AND email_verified_at IS NOT NULL",
+        "SELECT id FROM users WHERE id = $1 AND is_enabled = true AND email_verified_at IS NOT NULL",
     )
     .bind(payload.receiver_id)
     .fetch_optional(&state.pool)

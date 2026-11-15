@@ -85,11 +85,11 @@ pub async fn ws_handler(
 
     let user = find_user_by_id(user_id, &state.pool)
         .await?
-        .ok_or_else(|| ErrorResponse::Authentication("User not found or inactive.".to_string()))?;
+        .ok_or_else(|| ErrorResponse::Authentication("User not found or disabled.".to_string()))?;
 
-    if !user.is_active || user.email_verified_at.is_none() {
+    if !user.is_enabled || user.email_verified_at.is_none() {
         return Err(ErrorResponse::Authentication(
-            "User is inactive.".to_string(),
+            "User account is disabled.".to_string(),
         ));
     }
 
@@ -120,6 +120,14 @@ async fn handle_socket(
     let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<String>();
 
     let mut shutdown_rx = manager.shutdown_notification();
+    let mut user_revocation_rx = manager.user_revocation_notification();
+
+    // Close the gap between upgrade authentication and revocation subscription.
+    match find_user_by_id(user.id, &state.pool).await {
+        Ok(Some(current_user))
+            if current_user.is_enabled && current_user.token_version == token_version => {}
+        _ => return,
+    }
 
     // Split the WebSocket into sender + receiver halves.
     let (mut ws_sender, mut ws_receiver) = socket.split();
@@ -267,7 +275,7 @@ async fn handle_socket(
                     }
                 };
                 match find_user_by_id(user.id, &state.pool).await {
-                    Ok(Some(u)) if u.is_active && u.email_verified_at.is_some() && u.token_version == claims.token_version => {}
+                    Ok(Some(u)) if u.is_enabled && u.email_verified_at.is_some() && u.token_version == claims.token_version => {}
                     Ok(_) => {
                         let err_msg = json!({
                             "type": WS_ERROR,
@@ -290,6 +298,12 @@ async fn handle_socket(
             _ = shutdown_rx.recv() => {
                 let _ = ws_sender.send(Message::Close(None)).await;
                 break;
+            }
+            Ok(revoked_user_id) = user_revocation_rx.recv() => {
+                if revoked_user_id == user.id {
+                    let _ = ws_sender.send(Message::Close(None)).await;
+                    break;
+                }
             }
         }
     }
@@ -454,9 +468,9 @@ async fn handle_incoming(
             let current_user = find_user_by_id(user.id, &state.pool)
                 .await?
                 .ok_or_else(|| ErrorResponse::Authentication("User not found.".to_string()))?;
-            if !current_user.is_active || current_user.email_verified_at.is_none() {
+            if !current_user.is_enabled || current_user.email_verified_at.is_none() {
                 return Err(ErrorResponse::Authentication(
-                    "User is inactive.".to_string(),
+                    "User account is disabled.".to_string(),
                 ));
             }
             if current_user.token_version != token_version {

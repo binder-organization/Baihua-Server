@@ -50,6 +50,12 @@ pub async fn login(
         ));
     }
 
+    if !user.is_enabled {
+        return Err(ErrorResponse::Authentication(
+            "User account is disabled.".to_string(),
+        ));
+    }
+
     if user.email_verified_at.is_none() {
         return Err(ErrorResponse::Authentication(
             "Email address is not verified.".to_string(),

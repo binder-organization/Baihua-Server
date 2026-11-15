@@ -26,11 +26,13 @@ pub struct ConnectionManager {
     grace_periods: RwLock<HashMap<Uuid, (Uuid, Instant)>>,
 
     shutdown: broadcast::Sender<()>,
+    revoked_users: broadcast::Sender<Uuid>,
 }
 
 impl ConnectionManager {
     pub fn new() -> Self {
         let (shutdown, _) = broadcast::channel(1);
+        let (revoked_users, _) = broadcast::channel(1024);
         Self {
             rooms: RwLock::new(HashMap::new()),
             user_connections: RwLock::new(HashMap::new()),
@@ -40,6 +42,7 @@ impl ConnectionManager {
             ready_states: RwLock::new(HashMap::new()),
             grace_periods: RwLock::new(HashMap::new()),
             shutdown,
+            revoked_users,
         }
     }
 
@@ -361,6 +364,15 @@ impl ConnectionManager {
     // Subscribe to the global shutdown signal.
     pub fn shutdown_notification(&self) -> broadcast::Receiver<()> {
         self.shutdown.subscribe()
+    }
+
+    // Notify existing connections when account access is disabled.
+    pub fn revoke_user_connections(&self, user_id: Uuid) {
+        let _ = self.revoked_users.send(user_id);
+    }
+
+    pub fn user_revocation_notification(&self) -> broadcast::Receiver<Uuid> {
+        self.revoked_users.subscribe()
     }
 }
 

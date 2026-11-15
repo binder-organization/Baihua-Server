@@ -156,7 +156,7 @@ class RoomRequestChatTest:
         assert users[0]["username"] == user_b["username"]
 
         # The search result must never leak private profile fields.
-        for private_key in ("email", "phone_number", "is_active"):
+        for private_key in ("email", "phone_number", "is_enabled"):
             assert private_key not in users[0]
 
     # ── R2 ────────────────────────────────────────────────────────────

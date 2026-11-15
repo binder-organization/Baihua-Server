@@ -405,7 +405,7 @@ class TestPublicProfile:
         assert data["id"] == user["id"]
         assert data["username"] == user["username"]
         assert data["nickname"] is None
-        for private_key in ("email", "phone_number", "is_active", "created_at"):
+        for private_key in ("email", "phone_number", "is_enabled", "created_at"):
             assert private_key not in data
 
     def test_get_by_username_matches_by_id(

@@ -48,7 +48,7 @@ pub async fn search_users(
         (Some(username), _) => {
             let rows = sqlx::query(
                 "SELECT id, username, nickname, bio, avatar FROM users \
-                 WHERE is_active = true AND email_verified_at IS NOT NULL AND username ILIKE '%' || $1 || '%' \
+                 WHERE is_enabled = true AND email_verified_at IS NOT NULL AND username ILIKE '%' || $1 || '%' \
                  ORDER BY created_at DESC LIMIT $2 OFFSET $3",
             )
             .bind(username)
@@ -59,7 +59,7 @@ pub async fn search_users(
 
             let count: i64 = sqlx::query_scalar(
                 "SELECT count(*)::bigint FROM users \
-                 WHERE is_active = true AND email_verified_at IS NOT NULL AND username ILIKE '%' || $1 || '%'",
+                 WHERE is_enabled = true AND email_verified_at IS NOT NULL AND username ILIKE '%' || $1 || '%'",
             )
             .bind(username)
             .fetch_one(&state.pool)
@@ -70,7 +70,7 @@ pub async fn search_users(
         (None, Some(user_id)) => {
             let rows = sqlx::query(
                 "SELECT id, username, nickname, bio, avatar FROM users \
-                 WHERE is_active = true AND email_verified_at IS NOT NULL AND id = $1 \
+                 WHERE is_enabled = true AND email_verified_at IS NOT NULL AND id = $1 \
                  ORDER BY created_at DESC LIMIT $2 OFFSET $3",
             )
             .bind(user_id)
@@ -81,7 +81,7 @@ pub async fn search_users(
 
             let count: i64 = sqlx::query_scalar(
                 "SELECT count(*)::bigint FROM users \
-                 WHERE is_active = true AND email_verified_at IS NOT NULL AND id = $1",
+                 WHERE is_enabled = true AND email_verified_at IS NOT NULL AND id = $1",
             )
             .bind(user_id)
             .fetch_one(&state.pool)

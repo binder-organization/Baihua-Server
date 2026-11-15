@@ -110,7 +110,7 @@ pub async fn get_public_profile(
         Ok(user_id) => {
             sqlx::query(
                 "SELECT id, username, nickname, bio, avatar FROM users \
-                 WHERE is_active = true AND id = $1",
+                 WHERE is_enabled = true AND id = $1",
             )
             .bind(user_id)
             .fetch_optional(&state.pool)
@@ -119,7 +119,7 @@ pub async fn get_public_profile(
         Err(_) => {
             sqlx::query(
                 "SELECT id, username, nickname, bio, avatar FROM users \
-                 WHERE is_active = true AND username = $1",
+                 WHERE is_enabled = true AND username = $1",
             )
             .bind(&user_key)
             .fetch_optional(&state.pool)
@@ -235,7 +235,7 @@ pub(crate) async fn respond_with_full_user(
     message: String,
 ) -> Result<StandardResponse, ErrorResponse> {
     let user = sqlx::query(
-        "SELECT id, username, email, nickname, phone_number, bio, avatar, created_at, is_active \
+        "SELECT id, username, email, nickname, phone_number, bio, avatar, created_at, is_enabled \
          FROM users WHERE id = $1",
     )
     .bind(auth_user.user_id)
@@ -255,7 +255,7 @@ pub(crate) async fn respond_with_full_user(
                 "bio": user.get::<Option<String>, _>("bio"),
                 "avatar": user.get::<Option<String>, _>("avatar"),
                 "created_at": user.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-                "is_active": user.get::<bool, _>("is_active"),
+                "is_enabled": user.get::<bool, _>("is_enabled"),
             }
         }),
     ))

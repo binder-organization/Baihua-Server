@@ -2,6 +2,7 @@ use crate::ServerState;
 use crate::infrastructure::log::LogFilterHandle;
 use crate::middleware::rate_limit::SlidingWindowRateLimiter;
 use rustyline::DefaultEditor;
+use sqlx::Row;
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -97,6 +98,10 @@ async fn dispatch_command(
             dispatch_rate_limit_command(arguments, state).await;
             false
         }
+        "user" => {
+            dispatch_user_command(arguments, state).await;
+            false
+        }
         "log" => {
             dispatch_log_command(arguments, log_filter_handle, current_filter);
             false
@@ -160,7 +165,7 @@ fn forward_input_lines(line_tx: mpsc::Sender<String>, mut acknowledgement_rx: mp
 
 // Prints the list of supported console commands.
 fn print_help() {
-    let commands: [(&str, &str); 8] = [
+    let commands: [(&str, &str); 11] = [
         ("status", "Show the server status."),
         (
             "connections",
@@ -176,6 +181,15 @@ fn print_help() {
             "Show or replace the global log filter.",
         ),
         ("restart", "Restart the server."),
+        (
+            "user status <username>",
+            "Show whether a user account is enabled.",
+        ),
+        (
+            "user disable <username>",
+            "Disable an account and revoke its sessions.",
+        ),
+        ("user enable <username>", "Enable a disabled account."),
         ("stop", "Shut down the server."),
         ("help", "Get help."),
     ];
@@ -183,6 +197,68 @@ fn print_help() {
     println!("Available commands:");
     for (command, description) in commands {
         println!("  {:<28}- {}", command, description);
+    }
+}
+
+// Manage account access from the development console without exposing an endpoint.
+async fn dispatch_user_command(arguments: &[&str], state: &ServerState) {
+    match arguments {
+        ["status", username] => {
+            let result = sqlx::query("SELECT is_enabled FROM users WHERE username = $1")
+                .bind(username)
+                .fetch_optional(&state.pool)
+                .await;
+            match result {
+                Ok(Some(row)) => println!(
+                    "User '{}': {}.",
+                    username,
+                    if row.get::<bool, _>("is_enabled") {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                ),
+                Ok(None) => println!("User '{}' was not found.", username),
+                Err(database_error) => {
+                    error!("Failed to inspect user '{}': {}", username, database_error)
+                }
+            }
+        }
+        [action @ ("disable" | "enable"), username] => {
+            let enabled = *action == "enable";
+            let result = sqlx::query(
+                "UPDATE users SET is_enabled = $1, token_version = token_version + CASE WHEN is_enabled AND NOT $1 THEN 1 ELSE 0 END WHERE username = $2 RETURNING id",
+            )
+            .bind(enabled)
+            .bind(username)
+            .fetch_optional(&state.pool)
+            .await;
+            match result {
+                Ok(Some(row)) => {
+                    let user_id = row.get("id");
+                    if !enabled {
+                        state.connection_manager.revoke_user_connections(user_id);
+                    }
+                    info!(
+                        "User '{}' was {} by the development console.",
+                        username,
+                        if enabled { "enabled" } else { "disabled" }
+                    );
+                    println!(
+                        "User '{}' is now {}.",
+                        username,
+                        if enabled { "enabled" } else { "disabled" }
+                    );
+                }
+                Ok(None) => println!("User '{}' was not found.", username),
+                Err(database_error) => {
+                    error!("Failed to update user '{}': {}", username, database_error)
+                }
+            }
+        }
+        _ => println!(
+            "Usage: user status <username> | user disable <username> | user enable <username>"
+        ),
     }
 }
 

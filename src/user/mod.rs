@@ -75,9 +75,9 @@ pub struct User {
     pub avatar: Option<String>,
     // UTC datetime (serialized as RFC 3339).
     pub created_at: DateTime<Utc>,
-    pub is_active: bool,
+    pub is_enabled: bool,
     pub email_verified_at: Option<DateTime<Utc>>,
-    // Monotonic counter bumped on logout and password change; used to
+    // Monotonic counter bumped on logout, password change, and account disable; used to
     // invalidate previously issued JWTs. Never exposed to clients.
     #[serde(skip_serializing)]
     pub token_version: i64,
@@ -191,7 +191,7 @@ pub async fn new_user(
 
     // Insert user into database.
     sqlx::query(
-        "INSERT INTO users (id, username, email, password, created_at, is_active) VALUES ($1, $2, $3, $4, $5, $6)"
+        "INSERT INTO users (id, username, email, password, created_at, is_enabled) VALUES ($1, $2, $3, $4, $5, $6)"
     )
     .bind(uuid)
     .bind(&new_user.username)
@@ -216,7 +216,7 @@ pub async fn new_user(
         bio: None,
         avatar: None,
         created_at,
-        is_active: true,
+        is_enabled: true,
         email_verified_at: None,
         token_version: 0,
     })
@@ -228,7 +228,7 @@ pub async fn find_user_by_id(
     pool: &sqlx::Pool<sqlx::Postgres>,
 ) -> Result<Option<User>, ErrorResponse> {
     let row = sqlx::query(
-        r#"SELECT id, username, email, nickname, phone_number, bio, avatar, created_at, is_active, email_verified_at, token_version
+        r#"SELECT id, username, email, nickname, phone_number, bio, avatar, created_at, is_enabled, email_verified_at, token_version
            FROM users WHERE id = $1"#,
     )
     .bind(id)
@@ -245,7 +245,7 @@ pub async fn find_user_by_id(
             bio: row.get("bio"),
             avatar: row.get("avatar"),
             created_at: row.get("created_at"),
-            is_active: row.get("is_active"),
+            is_enabled: row.get("is_enabled"),
             email_verified_at: row.get("email_verified_at"),
             token_version: row.get("token_version"),
         })),
@@ -259,7 +259,7 @@ pub async fn find_user_by_username(
     pool: &sqlx::Pool<sqlx::Postgres>,
 ) -> Result<Option<User>, ErrorResponse> {
     let row = sqlx::query(
-        r#"SELECT id, username, email, nickname, phone_number, bio, avatar, created_at, is_active, email_verified_at, token_version
+        r#"SELECT id, username, email, nickname, phone_number, bio, avatar, created_at, is_enabled, email_verified_at, token_version
            FROM users WHERE username = $1"#,
     )
     .bind(username)
@@ -276,7 +276,7 @@ pub async fn find_user_by_username(
             bio: row.get("bio"),
             avatar: row.get("avatar"),
             created_at: row.get("created_at"),
-            is_active: row.get("is_active"),
+            is_enabled: row.get("is_enabled"),
             email_verified_at: row.get("email_verified_at"),
             token_version: row.get("token_version"),
         })),
@@ -293,7 +293,7 @@ pub async fn find_user_with_password(
         LoginIdentifier::Email(email) => (None, Some(email)),
     };
     let row = sqlx::query(
-        r#"SELECT id, username, email, password, nickname, phone_number, bio, avatar, created_at, is_active, email_verified_at, token_version
+        r#"SELECT id, username, email, password, nickname, phone_number, bio, avatar, created_at, is_enabled, email_verified_at, token_version
            FROM users WHERE ($1::text IS NOT NULL AND username = $1)
               OR ($2::text IS NOT NULL AND lower(email) = lower($2)
                   AND (
@@ -318,7 +318,7 @@ pub async fn find_user_with_password(
                 bio: row.get("bio"),
                 avatar: row.get("avatar"),
                 created_at: row.get("created_at"),
-                is_active: row.get("is_active"),
+                is_enabled: row.get("is_enabled"),
                 email_verified_at: row.get("email_verified_at"),
                 token_version: row.get("token_version"),
             };
