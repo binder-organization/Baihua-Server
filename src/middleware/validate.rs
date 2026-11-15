@@ -37,7 +37,7 @@ async fn validate_json_body(
         })?;
 
     let json_value: Value = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ErrorResponse::Json(format!("Invalid JSON format: {}.", e)))?;
+        .map_err(|error| ErrorResponse::Json(format!("Invalid JSON format: {}.", error)))?;
 
     Ok((parts, body_bytes, json_value))
 }
@@ -54,20 +54,20 @@ pub async fn validate_register(
 
     json_value
         .get("username")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| ErrorResponse::Validation("username is required.".to_string()))?;
 
     json_value
         .get("email")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| ErrorResponse::Validation("email is required.".to_string()))?;
 
     json_value
         .get("password")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| ErrorResponse::Validation("password is required.".to_string()))?;
 
     let request = Request::from_parts(parts, HttpBody::from(body_bytes));
@@ -84,16 +84,32 @@ pub async fn validate_login(
     let (parts, body_bytes, json_value) =
         validate_json_body(max_body_size, &headers, request).await?;
 
-    json_value
+    let username = json_value
         .get("username")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| ErrorResponse::Validation("username is required.".to_string()))?;
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let email = json_value
+        .get("email")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    match (username, email) {
+        (None, None) => {
+            return Err(ErrorResponse::Validation(
+                "username or email is required.".to_string(),
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err(ErrorResponse::Validation(
+                "Provide either username or email.".to_string(),
+            ));
+        }
+        _ => {}
+    }
 
     json_value
         .get("password")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| ErrorResponse::Validation("password is required.".to_string()))?;
 
     let request = Request::from_parts(parts, HttpBody::from(body_bytes));

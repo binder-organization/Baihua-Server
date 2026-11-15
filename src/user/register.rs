@@ -13,10 +13,11 @@ pub async fn register(
     JsonBody(user): JsonBody<UserRegister>,
 ) -> Result<StandardResponse, ErrorResponse> {
     let user_created = new_user(user, state.configuration.user.bcrypt_cost, &state.pool).await?;
+    super::email_verification::send_verification(&state, user_created.id).await?;
 
     Ok(StandardResponse::success(
         StatusCode::CREATED,
-        "User created successfully".to_string(),
+        "User created. Verify your email address before logging in.".to_string(),
         json!({
             "user": user_created
         }),

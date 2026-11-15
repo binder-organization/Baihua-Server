@@ -87,7 +87,7 @@ pub async fn ws_handler(
         .await?
         .ok_or_else(|| ErrorResponse::Authentication("User not found or inactive.".to_string()))?;
 
-    if !user.is_active {
+    if !user.is_active || user.email_verified_at.is_none() {
         return Err(ErrorResponse::Authentication(
             "User is inactive.".to_string(),
         ));
@@ -267,7 +267,7 @@ async fn handle_socket(
                     }
                 };
                 match find_user_by_id(user.id, &state.pool).await {
-                    Ok(Some(u)) if u.is_active && u.token_version == claims.token_version => {}
+                    Ok(Some(u)) if u.is_active && u.email_verified_at.is_some() && u.token_version == claims.token_version => {}
                     Ok(_) => {
                         let err_msg = json!({
                             "type": WS_ERROR,
@@ -454,7 +454,7 @@ async fn handle_incoming(
             let current_user = find_user_by_id(user.id, &state.pool)
                 .await?
                 .ok_or_else(|| ErrorResponse::Authentication("User not found.".to_string()))?;
-            if !current_user.is_active {
+            if !current_user.is_active || current_user.email_verified_at.is_none() {
                 return Err(ErrorResponse::Authentication(
                     "User is inactive.".to_string(),
                 ));

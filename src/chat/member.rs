@@ -61,6 +61,11 @@ pub async fn add_members(
                     "User not found: {}",
                     username
                 )))?;
+        if user.email_verified_at.is_none() {
+            return Err(ErrorResponse::Forbidden(
+                "A group member's email address is not verified.".to_string(),
+            ));
+        }
 
         // Check if already a member.
         let already_member =

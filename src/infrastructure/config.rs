@@ -8,6 +8,8 @@ pub struct ServerConfiguration {
     pub database: DatabaseConfiguration,
     pub user: UserConfiguration,
     #[serde(default)]
+    pub email_verification: EmailVerificationConfiguration,
+    #[serde(default)]
     pub rate_limit: RateLimitConfiguration,
     #[serde(default)]
     pub websocket: WebSocketConfiguration,
@@ -71,6 +73,69 @@ pub struct UserConfiguration {
     pub bcrypt_cost: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmailVerificationConfiguration {
+    #[serde(default = "default_email_send_limit")]
+    pub sends_per_email_per_minute: u32,
+    #[serde(default = "default_email_token_lifetime")]
+    pub token_lifetime_minutes: u32,
+    #[serde(default)]
+    pub sender_address: String,
+    #[serde(default = "default_sender_name")]
+    pub sender_name: String,
+    #[serde(default)]
+    pub server_address: String,
+    #[serde(default = "default_mail_server_port")]
+    pub server_port: u16,
+    #[serde(default = "default_mail_security")]
+    pub security: String,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub verification_url: String,
+    #[serde(default = "default_email_subject")]
+    pub subject: String,
+    #[serde(default)]
+    pub template_path: String,
+}
+
+impl Default for EmailVerificationConfiguration {
+    fn default() -> Self {
+        Self {
+            sends_per_email_per_minute: default_email_send_limit(),
+            token_lifetime_minutes: default_email_token_lifetime(),
+            sender_address: String::new(),
+            sender_name: default_sender_name(),
+            server_address: String::new(),
+            server_port: default_mail_server_port(),
+            security: default_mail_security(),
+            username: String::new(),
+            verification_url: String::new(),
+            subject: default_email_subject(),
+            template_path: String::new(),
+        }
+    }
+}
+
+fn default_email_send_limit() -> u32 {
+    2
+}
+fn default_sender_name() -> String {
+    "Baihua".to_string()
+}
+fn default_email_subject() -> String {
+    "Verify your Baihua email address".to_string()
+}
+fn default_email_token_lifetime() -> u32 {
+    15
+}
+fn default_mail_server_port() -> u16 {
+    587
+}
+fn default_mail_security() -> String {
+    "starttls".to_string()
+}
+
 // Rate limiting configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitConfiguration {
@@ -125,6 +190,20 @@ mod tests {
         assert!(configuration.validate().is_err());
 
         configuration.file.download_mibps = 1;
+        assert!(configuration.validate().is_ok());
+    }
+
+    #[test]
+    fn email_delivery_rejects_unbounded_or_disabled_limits() {
+        let mut configuration = ServerConfiguration::default();
+        configuration.email_verification.sends_per_email_per_minute = 0;
+        assert!(configuration.validate().is_err());
+
+        configuration.email_verification.sends_per_email_per_minute = 2;
+        configuration.email_verification.token_lifetime_minutes = 31;
+        assert!(configuration.validate().is_err());
+
+        configuration.email_verification.token_lifetime_minutes = 15;
         assert!(configuration.validate().is_ok());
     }
 }
@@ -345,6 +424,7 @@ impl Default for ServerConfiguration {
                 jsonwebtoken_expiration_hours: default_jsonwebtoken_expiration_hours(),
                 bcrypt_cost: default_bcrypt_cost(),
             },
+            email_verification: EmailVerificationConfiguration::default(),
             rate_limit: RateLimitConfiguration::default(),
             websocket: WebSocketConfiguration::default(),
             room_request: RoomRequestConfiguration::default(),
@@ -461,6 +541,27 @@ jsonwebtoken_expiration_hours = 24
 # defaults to 10. Must be between 4 and 31; higher values are slower but
 # more resistant to brute-force attacks.
 bcrypt_cost = 10
+
+# ---- Email Verification ----
+
+[email_verification]
+# Each address may receive this many messages in a rolling minute.
+sends_per_email_per_minute = 2
+# Verification links expire after 15 minutes. Maximum allowed is 30.
+token_lifetime_minutes = 15
+# Set these values before accepting registrations.
+sender_address = ""
+sender_name = "Baihua"
+server_address = ""
+server_port = 587
+# "starttls" for port 587 or "implicit" for port 465.
+security = "starttls"
+username = ""
+# The password is read from BAIHUA_MAIL_PASSWORD, never from this file.
+verification_url = ""
+subject = "Verify your Baihua email address"
+# Optional UTF-8 text file. Supports {{username}}, {{verification_url}}, {{expires_minutes}}.
+template_path = ""
 
 # ---- Rate Limiting ----
 
@@ -579,6 +680,21 @@ download_mibps = 0
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.email_verification.sends_per_email_per_minute == 0 {
+            bail!("The email send limit must be greater than zero.");
+        }
+        if !(1..=30).contains(&self.email_verification.token_lifetime_minutes) {
+            bail!("The email verification token lifetime must be between 1 and 30 minutes.");
+        }
+        if !["starttls", "implicit"].contains(&self.email_verification.security.as_str()) {
+            bail!("The mail security mode must be starttls or implicit.");
+        }
+        if self.email_verification.server_port == 0 {
+            bail!("The mail server port must be greater than zero.");
+        }
+        if self.email_verification.subject.trim().is_empty() {
+            bail!("The email verification subject cannot be empty.");
+        }
         if self.web.port == 0 {
             bail!("The server port cannot be 0.");
         }

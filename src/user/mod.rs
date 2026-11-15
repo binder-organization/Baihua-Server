@@ -1,5 +1,6 @@
 pub(crate) mod avatar;
 mod delete;
+mod email_verification;
 mod login;
 mod logout;
 mod password;
@@ -75,6 +76,7 @@ pub struct User {
     // UTC datetime (serialized as RFC 3339).
     pub created_at: DateTime<Utc>,
     pub is_active: bool,
+    pub email_verified_at: Option<DateTime<Utc>>,
     // Monotonic counter bumped on logout and password change; used to
     // invalidate previously issued JWTs. Never exposed to clients.
     #[serde(skip_serializing)]
@@ -90,8 +92,14 @@ pub struct UserRegister {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct UserLogin {
-    pub username: String,
+    pub username: Option<String>,
+    pub email: Option<String>,
     pub password: String,
+}
+
+pub(crate) enum LoginIdentifier<'a> {
+    Username(&'a str),
+    Email(&'a str),
 }
 
 impl UserRegister {
@@ -148,29 +156,29 @@ impl UserRegister {
                 "Username cannot be in UUID format.".to_string(),
             ));
         }
-        
+
         Ok(())
     }
 }
 
 pub async fn new_user(
-    new_user: UserRegister,
+    mut new_user: UserRegister,
     bcrypt_cost: u32,
     pool: &sqlx::Pool<sqlx::Postgres>,
 ) -> Result<User, ErrorResponse> {
     // Validate the user.
     new_user.validate().await?;
+    new_user.email = new_user.email.to_lowercase();
 
-    // Check if username or email already exists.
-    let existing_user = sqlx::query("SELECT id FROM users WHERE username = $1 OR email = $2")
+    // Keep account identity separate from the mailbox used for verification.
+    let existing_user = sqlx::query("SELECT id FROM users WHERE username = $1")
         .bind(&new_user.username)
-        .bind(&new_user.email)
         .fetch_optional(pool)
         .await?;
 
     if existing_user.is_some() {
         return Err(ErrorResponse::Validation(
-            "Username or email already exists.".to_string(),
+            "Username already exists.".to_string(),
         ));
     }
 
@@ -209,6 +217,7 @@ pub async fn new_user(
         avatar: None,
         created_at,
         is_active: true,
+        email_verified_at: None,
         token_version: 0,
     })
 }
@@ -219,7 +228,7 @@ pub async fn find_user_by_id(
     pool: &sqlx::Pool<sqlx::Postgres>,
 ) -> Result<Option<User>, ErrorResponse> {
     let row = sqlx::query(
-        r#"SELECT id, username, email, nickname, phone_number, bio, avatar, created_at, is_active, token_version
+        r#"SELECT id, username, email, nickname, phone_number, bio, avatar, created_at, is_active, email_verified_at, token_version
            FROM users WHERE id = $1"#,
     )
     .bind(id)
@@ -237,6 +246,7 @@ pub async fn find_user_by_id(
             avatar: row.get("avatar"),
             created_at: row.get("created_at"),
             is_active: row.get("is_active"),
+            email_verified_at: row.get("email_verified_at"),
             token_version: row.get("token_version"),
         })),
         None => Ok(None),
@@ -249,7 +259,7 @@ pub async fn find_user_by_username(
     pool: &sqlx::Pool<sqlx::Postgres>,
 ) -> Result<Option<User>, ErrorResponse> {
     let row = sqlx::query(
-        r#"SELECT id, username, email, nickname, phone_number, bio, avatar, created_at, is_active, token_version
+        r#"SELECT id, username, email, nickname, phone_number, bio, avatar, created_at, is_active, email_verified_at, token_version
            FROM users WHERE username = $1"#,
     )
     .bind(username)
@@ -267,6 +277,7 @@ pub async fn find_user_by_username(
             avatar: row.get("avatar"),
             created_at: row.get("created_at"),
             is_active: row.get("is_active"),
+            email_verified_at: row.get("email_verified_at"),
             token_version: row.get("token_version"),
         })),
         None => Ok(None),
@@ -274,14 +285,24 @@ pub async fn find_user_by_username(
 }
 
 pub async fn find_user_with_password(
-    username: &str,
+    identifier: LoginIdentifier<'_>,
     pool: &sqlx::Pool<sqlx::Postgres>,
 ) -> Result<Option<(User, String)>, ErrorResponse> {
+    let (username, email) = match identifier {
+        LoginIdentifier::Username(username) => (Some(username), None),
+        LoginIdentifier::Email(email) => (None, Some(email)),
+    };
     let row = sqlx::query(
-        r#"SELECT id, username, email, password, nickname, phone_number, bio, avatar, created_at, is_active, token_version
-           FROM users WHERE username = $1"#,
+        r#"SELECT id, username, email, password, nickname, phone_number, bio, avatar, created_at, is_active, email_verified_at, token_version
+           FROM users WHERE ($1::text IS NOT NULL AND username = $1)
+              OR ($2::text IS NOT NULL AND lower(email) = lower($2)
+                  AND (
+                      SELECT count(*) FROM users AS matching_users
+                      WHERE lower(matching_users.email) = lower($2)
+                  ) = 1)"#,
     )
     .bind(username)
+    .bind(email)
     .fetch_optional(pool)
     .await?;
 
@@ -298,6 +319,7 @@ pub async fn find_user_with_password(
                 avatar: row.get("avatar"),
                 created_at: row.get("created_at"),
                 is_active: row.get("is_active"),
+                email_verified_at: row.get("email_verified_at"),
                 token_version: row.get("token_version"),
             };
             Ok(Some((user, password)))
@@ -308,6 +330,19 @@ pub async fn find_user_with_password(
 
 pub fn router(state: Arc<ServerState>) -> axum::Router<Arc<ServerState>> {
     let public = axum::Router::new()
+        .route(
+            "/verify-email",
+            axum::routing::get(email_verification::verify_email),
+        )
+        .route(
+            "/resend-verification",
+            axum::routing::post(email_verification::resend_verification).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    middleware::rate_limit::rate_limit_register,
+                ),
+            ),
+        )
         .route(
             "/register",
             axum::routing::post(register::register)

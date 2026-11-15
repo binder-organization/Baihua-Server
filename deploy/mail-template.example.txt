@@ -1,0 +1,6 @@
+Hello {{username}},
+
+Please verify your Baihua email address by opening this link:
+{{verification_url}}
+
+The link expires in {{expires_minutes}} minutes. If you did not create this account, you can ignore this message.

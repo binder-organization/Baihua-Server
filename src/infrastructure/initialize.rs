@@ -9,6 +9,7 @@ use crate::websocket::connection::ConnectionManager;
 use anyhow::{Context, Result, anyhow};
 use dirs::home_dir;
 use jsonwebtoken::crypto::{CryptoProvider, rust_crypto::DEFAULT_PROVIDER};
+use lettre::message::Mailbox;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
@@ -27,6 +28,70 @@ pub async fn initialize(environment: Environment) -> Result<(ServerState, LogSys
 
     // Load configuration.
     let mut configuration = load_or_create_profile(&app_directory).await?;
+    if let Ok(sender_address) = std::env::var("BAIHUA_MAIL_SENDER_ADDRESS")
+        && !sender_address.is_empty()
+    {
+        configuration.email_verification.sender_address = sender_address;
+    }
+    if let Ok(sender_name) = std::env::var("BAIHUA_MAIL_SENDER_NAME")
+        && !sender_name.is_empty()
+    {
+        configuration.email_verification.sender_name = sender_name;
+    }
+    if let Ok(server_address) = std::env::var("BAIHUA_MAIL_SERVER_ADDRESS")
+        && !server_address.is_empty()
+    {
+        configuration.email_verification.server_address = server_address;
+    }
+    if let Ok(server_port) = std::env::var("BAIHUA_MAIL_SERVER_PORT")
+        && !server_port.is_empty()
+    {
+        configuration.email_verification.server_port =
+            server_port.parse().context("Invalid mail server port.")?;
+    }
+    if let Ok(security) = std::env::var("BAIHUA_MAIL_SECURITY")
+        && !security.is_empty()
+    {
+        configuration.email_verification.security = security;
+    }
+    if let Ok(username) = std::env::var("BAIHUA_MAIL_USERNAME")
+        && !username.is_empty()
+    {
+        configuration.email_verification.username = username;
+    }
+    if let Ok(subject) = std::env::var("BAIHUA_MAIL_SUBJECT")
+        && !subject.is_empty()
+    {
+        configuration.email_verification.subject = subject;
+    }
+    if let Ok(template_path) = std::env::var("BAIHUA_MAIL_TEMPLATE_PATH")
+        && !template_path.is_empty()
+    {
+        configuration.email_verification.template_path = template_path;
+    }
+    if let Ok(send_limit) = std::env::var("BAIHUA_MAIL_SENDS_PER_EMAIL_PER_MINUTE")
+        && !send_limit.is_empty()
+    {
+        configuration.email_verification.sends_per_email_per_minute = send_limit
+            .parse()
+            .context("Invalid per-email send limit.")?;
+    }
+    if let Ok(token_lifetime) = std::env::var("BAIHUA_EMAIL_TOKEN_LIFETIME_MINUTES")
+        && !token_lifetime.is_empty()
+    {
+        configuration.email_verification.token_lifetime_minutes = token_lifetime
+            .parse()
+            .context("Invalid email token lifetime.")?;
+    }
+    if let Ok(verification_url) = std::env::var("BAIHUA_VERIFICATION_BASE_URL")
+        && !verification_url.is_empty()
+    {
+        configuration.email_verification.verification_url = verification_url;
+    } else if let Ok(domain) = std::env::var("BAIHUA_DOMAIN")
+        && !domain.is_empty()
+    {
+        configuration.email_verification.verification_url = format!("https://{domain}:2424");
+    }
     if let Ok(grace_period) = std::env::var("BAIHUA_ENCRYPTED_GRACE_PERIOD_SECS") {
         configuration.websocket.encrypted_grace_period_secs = grace_period
             .parse()
@@ -53,6 +118,44 @@ pub async fn initialize(environment: Environment) -> Result<(ServerState, LogSys
             .context("Invalid file upload idle timeout.")?;
     }
     configuration.validate()?;
+    if configuration.email_verification.sender_address.is_empty()
+        || configuration.email_verification.server_address.is_empty()
+        || configuration.email_verification.verification_url.is_empty()
+    {
+        anyhow::bail!(
+            "Email verification requires a sender address, mail server address, and public verification URL."
+        );
+    }
+    format!(
+        "{} <{}>",
+        configuration.email_verification.sender_name,
+        configuration.email_verification.sender_address
+    )
+    .parse::<Mailbox>()
+    .context("Invalid email verification sender address.")?;
+    if environment.is_production()
+        && !configuration
+            .email_verification
+            .verification_url
+            .starts_with("https://")
+    {
+        anyhow::bail!("The production verification URL must use encrypted transport.");
+    }
+    if !configuration.email_verification.template_path.is_empty() {
+        let template = fs::read_to_string(&configuration.email_verification.template_path)
+            .await
+            .context("Failed to read the email verification template.")?;
+        if !template.contains("{{verification_url}}") {
+            anyhow::bail!("The email template must contain {{verification_url}}.");
+        }
+    }
+    if !configuration.email_verification.username.is_empty()
+        && std::env::var("BAIHUA_MAIL_PASSWORD")
+            .unwrap_or_default()
+            .is_empty()
+    {
+        anyhow::bail!("BAIHUA_MAIL_PASSWORD is required when mail authentication is configured.");
+    }
 
     let directory = Directory {
         app: app_directory.clone(),

@@ -128,7 +128,7 @@ class TestRegister:
 
 class TestLogin:
     def test_missing_username(self, session: requests.Session, base_url: str):
-        """Login without username should fail validation."""
+        """Login without either identifier should fail validation."""
         resp = session.post(
             f"{base_url}/api/v1/user/login",
             json={"password": "somepass"},
@@ -137,7 +137,7 @@ class TestLogin:
 
         body = resp.json()
         assert body["code"] == "VALIDATION_ERROR"
-        assert "username is required" in body["message"].lower()
+        assert "username or email is required" in body["message"].lower()
 
     def test_missing_password(self, session: requests.Session, base_url: str):
         """Login without password should fail validation."""
@@ -176,7 +176,7 @@ class TestLogin:
         assert resp.status_code == 400
         body = resp.json()
         assert body["code"] == "VALIDATION_ERROR"
-        assert "username is required" in body["message"].lower()
+        assert "username or email is required" in body["message"].lower()
 
     def test_empty_username_string(self, session: requests.Session, base_url: str):
         """Should reject login with empty username string."""
@@ -187,7 +187,31 @@ class TestLogin:
         assert resp.status_code == 400
         body = resp.json()
         assert body["code"] == "VALIDATION_ERROR"
-        assert "username is required" in body["message"].lower()
+        assert "username or email is required" in body["message"].lower()
+
+    def test_email_without_username_passes_validation(
+        self, session: requests.Session, base_url: str
+    ):
+        response = session.post(
+            f"{base_url}/api/v1/user/login",
+            json={"email": "nobody@example.com", "password": "somepass"},
+        )
+        assert response.status_code == 401, response.text
+        assert response.json()["code"] == "AUTHENTICATION_ERROR"
+
+    def test_username_and_email_together_are_rejected(
+        self, session: requests.Session, base_url: str
+    ):
+        response = session.post(
+            f"{base_url}/api/v1/user/login",
+            json={
+                "username": "someone",
+                "email": "someone@example.com",
+                "password": "somepass",
+            },
+        )
+        assert response.status_code == 400, response.text
+        assert response.json()["code"] == "VALIDATION_ERROR"
 
     def test_empty_password_string(self, session: requests.Session, base_url: str):
         """Should reject login with empty password string."""

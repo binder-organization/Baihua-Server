@@ -29,4 +29,6 @@ regex = "1.12.3"
 lazy_static = "1.5.0"
 base64 = "0.22"
 sha2 = "0.10"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "rustls-tls"] }
+rand = "0.9"
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }

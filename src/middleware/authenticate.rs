@@ -40,7 +40,7 @@ pub async fn authenticate(
 
     let user = find_user_by_id(user_id, &state.pool).await?;
     match &user {
-        Some(user) if user.is_active => {}
+        Some(user) if user.is_active && user.email_verified_at.is_some() => {}
         _ => {
             return Err(ErrorResponse::Authentication(
                 "User not found or inactive.".to_string(),

@@ -64,6 +64,11 @@ pub async fn create_or_get_room(
                 "Cannot create a room with yourself.".to_string(),
             ));
         }
+        if target_user.email_verified_at.is_none() {
+            return Err(ErrorResponse::Forbidden(
+                "Target user's email address is not verified.".to_string(),
+            ));
+        }
 
         let existing_room = find_private_room(
             &state.pool,
@@ -150,6 +155,11 @@ async fn create_group_room(
         if user.id == auth_user.user_id {
             return Err(ErrorResponse::BadRequest(
                 "Cannot add yourself to the usernames list. You are automatically included as the creator.".to_string(),
+            ));
+        }
+        if user.email_verified_at.is_none() {
+            return Err(ErrorResponse::Forbidden(
+                "A group member's email address is not verified.".to_string(),
             ));
         }
 
@@ -255,6 +265,11 @@ pub(crate) async fn create_private_room(
     if target_user.id == auth_user.user_id {
         return Err(ErrorResponse::BadRequest(
             "Cannot create a room with yourself.".to_string(),
+        ));
+    }
+    if target_user.email_verified_at.is_none() {
+        return Err(ErrorResponse::Forbidden(
+            "Target user's email address is not verified.".to_string(),
         ));
     }
 

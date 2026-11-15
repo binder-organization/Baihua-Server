@@ -132,6 +132,8 @@ docker compose --env-file .env.production --profile production down
 
 ### Upgrade an existing deployment
 
+The current development schema is consolidated for a new database. A database initialized with earlier migration files cannot use these changed files in place because migration checksums differ. Keep its data and prepare a dedicated upgrade path before using a newer build.
+
 Back up production data first, then update the repository and rebuild the containers:
 
 ```bash

@@ -99,10 +99,12 @@ pub async fn create_room_request(
     }
 
     // The receiver must exist and be active.
-    let receiver = sqlx::query("SELECT id FROM users WHERE id = $1 AND is_active = true")
-        .bind(payload.receiver_id)
-        .fetch_optional(&state.pool)
-        .await?;
+    let receiver = sqlx::query(
+        "SELECT id FROM users WHERE id = $1 AND is_active = true AND email_verified_at IS NOT NULL",
+    )
+    .bind(payload.receiver_id)
+    .fetch_optional(&state.pool)
+    .await?;
 
     if receiver.is_none() {
         return Err(ErrorResponse::BadRequest(
