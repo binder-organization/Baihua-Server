@@ -81,6 +81,8 @@ docker compose --env-file .env.production --profile production up -d --build
 > Later build times depend on which build layers remain cached.
 > To watch build progress, use `docker compose --env-file .env.production --profile production up --build` (without `-d`).
 
+Configure email verification in `.env.production`: set the mail sender, server, and password, and check that the verification address matches the public domain. Nonempty mail values from this file override `config.toml`; the mail password is read only from the environment. No additional production configuration file is needed.
+
 Before starting a public deployment, check these items:
 
 - Install Docker and Docker Compose on the deployment host.
