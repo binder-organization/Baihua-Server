@@ -23,5 +23,11 @@ class TestGreet:
         assert resp.status_code == 200
 
         body = resp.json()
-        assert body["server_version"] == _server_version()
-        assert body["api_version"] == "v1"
+        assert body["code"] == "SUCCESS"
+        assert body["message"] == "Welcome to the test server."
+        assert body["response_id"]
+        assert body["data"]["server_identity"] == "baihua"
+        assert body["data"]["server_version"] == _server_version()
+        assert body["data"]["api_version"] == "v1"
+        assert body["data"]["uptime_seconds"] >= 0
+        assert body["data"]["health"] == {"status": "ok", "database": "reachable"}

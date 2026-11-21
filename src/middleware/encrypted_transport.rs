@@ -12,7 +12,7 @@ pub async fn enforce_encrypted_transport(
 ) -> Response {
     if !state.environment.is_production()
         || !state.configuration.web.require_encrypted_transport
-        || request.uri().path() == "/health"
+        || request.uri().path() == "/greet"
         || request
             .headers()
             .get("x-forwarded-proto")

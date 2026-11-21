@@ -30,6 +30,11 @@ pub async fn initialize(environment: Environment) -> Result<(ServerState, LogSys
 
     // Load configuration.
     let mut configuration = load_or_create_profile(&app_directory).await?;
+    if let Ok(greet_message) = std::env::var("BAIHUA_GREET_MESSAGE")
+        && !greet_message.is_empty()
+    {
+        configuration.greet.message = greet_message;
+    }
     if let Ok(sender_address) = std::env::var("BAIHUA_MAIL_SENDER_ADDRESS")
         && !sender_address.is_empty()
     {

@@ -580,10 +580,6 @@ class TestGroupChat:
         resp = session.get(f"{base_url}/greet")
         assert resp.status_code == 200
 
-        # health
-        resp = session.get(f"{base_url}/health")
-        assert resp.status_code == 200
-
         # register
         uname = _unique("g15reg")
         resp = session.post(

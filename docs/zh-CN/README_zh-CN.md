@@ -97,6 +97,8 @@ docker compose --env-file .env.production --profile production up -d --build
 
 数据库端口只绑定到部署主机的本地地址，不会暴露到互联网。服务端没有主机端口映射，Caddy 通过 Docker 内部网络访问服务端。客户端使用 `https://BAIHUA_DOMAIN:2424` 连接；80 端口仅用于证书验证，并将访问者跳转到加密地址。WebSocket 客户端使用 `wss://BAIHUA_DOMAIN:2424/websocket` 连接。数据库记录保存在 `baihua-postgres-data` 卷，上传的头像保存在 `baihua-avatar-data` 卷。
 
+在 `.env.production` 中设置 `BAIHUA_GREET_MESSAGE` 可自定义公开的 `/greet` 问候语。默认值为 `Hello Baihua.`。响应始终包含 `server_identity: "baihua"`，客户端不必依赖问候语识别服务器。
+
 生产环境中，服务端默认拒绝没有经过加密连接的请求。Caddy 会自动添加加密标记，并忽略客户端自行提供的同名标记。不要把服务端端口直接暴露到公网。如果使用其他反向代理，请确保它只在加密连接时将 `X-Forwarded-Proto` 设为 `https`。容器内部运行的健康检查不受此限制。默认开启这项检查；只有明确将 `.env.production` 中的 `BAIHUA_REQUIRE_ENCRYPTED_TRANSPORT` 设为 `false` 才会关闭。开发环境不执行这项检查。
 
 如需公开访问，在 `.env.production` 中将 `BAIHUA_DOMAIN` 设为指向此主机的域名，并允许外部连接端口 80 和 2424。Caddy 会随生产配置自动启动、申请并续期证书，并将未加密请求跳转到 2424 端口。服务端默认强制加密；只有确实需要接受未加密请求时，才将 `BAIHUA_REQUIRE_ENCRYPTED_TRANSPORT` 设为 `false`：
@@ -109,7 +111,7 @@ docker compose --env-file .env.production --profile production up -d --build
 
 如果你已经使用其他反向代理、负载均衡或入口控制器，请从 Compose 部署中移除 `reverse-proxy` 服务，并让现有入口代理通过 Docker 内部网络转发到服务端。同时确认它提供加密连接并转发 WebSocket 升级请求。
 
-服务端依赖数据库健康检查才启动，并自带 Docker HEALTHCHECK（`GET /health`）。查看日志：
+服务端依赖数据库健康检查才启动，并自带 Docker HEALTHCHECK（`GET /greet`）。查看日志：
 
 ```bash
 docker compose --env-file .env.production --profile production logs -f
@@ -133,7 +135,7 @@ docker compose --env-file .env.production --profile production up -d --build
 服务端启动时会自动执行数据库迁移。升级后检查服务健康状态并查看最近日志：
 
 ```bash
-docker compose --env-file .env.production --profile production exec -T server curl -fsS http://127.0.0.1:2424/health
+docker compose --env-file .env.production --profile production exec -T server curl -fsS http://127.0.0.1:2424/greet
 docker compose --env-file .env.production --profile production logs --tail=100
 ```
 

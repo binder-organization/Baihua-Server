@@ -84,6 +84,8 @@ docker compose --env-file .env.production --profile production up -d --build
 
 Configure email verification in `.env.production`: set the mail sender, server, and password, and check that the verification address matches the public domain. Nonempty mail values from this file override `config.toml`; the mail password is read only from the environment. No additional production configuration file is needed.
 
+Set `BAIHUA_GREET_MESSAGE` in `.env.production` to customize the public `/greet` message. The default is `Hello Baihua.`. The response always includes `server_identity: "baihua"` so clients can recognize the server independently of the message.
+
 Before starting a public deployment, check these items:
 
 - Install Docker and Docker Compose on the deployment host.
@@ -121,7 +123,7 @@ The reverse proxy manages certificates and forwards WebSocket connections. Its c
 
 If you already use another reverse proxy, load balancer, or ingress controller, remove the `reverse-proxy` service from the Compose deployment and configure your existing entry point to forward traffic to the server on the private Docker network. Make sure it provides encrypted connections and forwards WebSocket upgrade requests.
 
-The server is gated by the database health check and includes a Docker HEALTHCHECK (`GET /health`). Logs:
+The server is gated by the database health check and includes a Docker HEALTHCHECK (`GET /greet`). Logs:
 
 ```bash
 docker compose --env-file .env.production --profile production logs -f
@@ -147,7 +149,7 @@ docker compose --env-file .env.production --profile production up -d --build
 The server runs database migrations during startup. After the upgrade, check service health and inspect recent logs:
 
 ```bash
-docker compose --env-file .env.production --profile production exec -T server curl -fsS http://127.0.0.1:2424/health
+docker compose --env-file .env.production --profile production exec -T server curl -fsS http://127.0.0.1:2424/greet
 docker compose --env-file .env.production --profile production logs --tail=100
 ```
 

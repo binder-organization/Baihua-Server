@@ -1,7 +1,6 @@
 use crate::ServerState;
 use crate::console::CommandType;
 use crate::greet::greet;
-use crate::health::health_check;
 use crate::middleware;
 use crate::websocket;
 use axum::Router;
@@ -27,7 +26,6 @@ pub async fn server(
 
     let app = Router::new()
         .route("/greet", get(greet))
-        .route("/health", get(health_check))
         .route("/websocket", get(websocket::handler::ws_handler))
         .route(
             "/static/avatars/{filename}",

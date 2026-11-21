@@ -107,6 +107,7 @@ class TestRun:
             "JWT_SECRET": uuid.uuid4().hex + uuid.uuid4().hex,
             "BAIHUA_ENCRYPTED_GRACE_PERIOD_SECS": "5",
             "BAIHUA_REQUIRE_ENCRYPTED_TRANSPORT": "false",
+            "BAIHUA_GREET_MESSAGE": "Welcome to the test server.",
             "BAIHUA_TEST_FILES_DIRECTORY": str(self.test_files_directory),
             "BAIHUA_TEST_MAIL_DIRECTORY": str(self.mail_directory),
             "BAIHUA_TEST_MAIL_MESSAGES_DIRECTORY": str(self.mail_messages_directory),
@@ -298,7 +299,7 @@ class TestRun:
             if self.server_process is not None and self.server_process.poll() is not None:
                 raise RuntimeError(self.server_log_tail())
             try:
-                with urllib.request.urlopen(f"{self.server_url}/health", timeout=2) as response:
+                with urllib.request.urlopen(f"{self.server_url}/greet", timeout=2) as response:
                     if response.status == 200:
                         log(f"Server ready: {self.server_url}")
                         return

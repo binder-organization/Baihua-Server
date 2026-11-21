@@ -5,7 +5,6 @@ mod chat;
 mod common;
 mod console;
 mod greet;
-mod health;
 mod infrastructure;
 mod middleware;
 mod server;

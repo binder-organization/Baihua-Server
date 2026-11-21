@@ -59,13 +59,13 @@ EXPOSE 2424
 # ---------------------------------------------------------------------------
 # HEALTHCHECK
 # Verifies both the server process AND database connectivity.
-# /health (src/health.rs) executes "SELECT 1" against PostgreSQL.
+# /greet (src/greet.rs) executes "SELECT 1" against PostgreSQL.
 #
 # Note: startup order is gated by docker-compose (database → service_healthy → server).
 # For standalone runs, ensure the database is reachable before this container starts.
 # ---------------------------------------------------------------------------
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:2424/health
+    CMD curl -f http://localhost:2424/greet
 
 # ---------------------------------------------------------------------------
 # REQUIRED RUNTIME ENVIRONMENT VARIABLES

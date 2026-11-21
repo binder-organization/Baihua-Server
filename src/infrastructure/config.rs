@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfiguration {
     pub web: WebConfiguration,
+    #[serde(default)]
+    pub greet: GreetConfiguration,
     pub logs: LogsConfiguration,
     pub database: DatabaseConfiguration,
     pub user: UserConfiguration,
@@ -32,6 +34,24 @@ pub struct WebConfiguration {
     pub max_body_size: u32,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GreetConfiguration {
+    #[serde(default = "default_greet_message")]
+    pub message: String,
+}
+
+impl Default for GreetConfiguration {
+    fn default() -> Self {
+        Self {
+            message: default_greet_message(),
+        }
+    }
+}
+
+fn default_greet_message() -> String {
+    "Hello Baihua.".to_string()
 }
 
 fn default_require_encrypted_transport() -> bool {
@@ -208,6 +228,21 @@ mod tests {
 
         configuration.email_verification.token_lifetime_minutes = 15;
         assert!(configuration.validate().is_ok());
+    }
+
+    #[test]
+    fn greeting_message_can_be_customized_but_cannot_be_empty_or_too_long() {
+        let mut configuration = ServerConfiguration::default();
+        assert_eq!(configuration.greet.message, "Hello Baihua.");
+
+        configuration.greet.message = "Welcome to this server.".to_string();
+        assert!(configuration.validate().is_ok());
+
+        configuration.greet.message = " ".to_string();
+        assert!(configuration.validate().is_err());
+
+        configuration.greet.message = "x".repeat(501);
+        assert!(configuration.validate().is_err());
     }
 }
 
@@ -412,6 +447,7 @@ impl Default for ServerConfiguration {
                 max_body_size: default_max_body_size(),
                 request_timeout_secs: default_request_timeout_secs(),
             },
+            greet: GreetConfiguration::default(),
             logs: LogsConfiguration {
                 level: default_log_level(),
             },
@@ -470,6 +506,14 @@ max_body_size = 10485760
 # aborted with a 408 Request Timeout. When omitted, defaults to 30.
 # Applies to /api/v1 requests only; WebSocket connections are exempt.
 request_timeout_secs = 30
+
+# ---- Greeting ----
+
+[greet]
+# Public message returned by GET /greet. The response always includes the
+# fixed server_identity field so clients can recognize Baihua servers.
+# Must contain visible text and be no longer than 500 characters.
+message = "Hello Baihua."
 
 # ---- Logging ----
 
@@ -686,6 +730,9 @@ download_mibps = 0
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.greet.message.trim().is_empty() || self.greet.message.chars().count() > 500 {
+            bail!("The greeting message must contain 1 to 500 characters of visible text.");
+        }
         if self.email_verification.sends_per_email_per_minute == 0 {
             bail!("The email send limit must be greater than zero.");
         }
