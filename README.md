@@ -40,6 +40,7 @@ Baihua is born to end this fragmented experience. It is a team communication too
 - **Docker** (for PostgreSQL)
 - **Rust toolchain** (stable, with rustfmt + clippy)
 - **Python 3.10+** and `pip install -r tests/requirements.txt` (for tests)
+- **OpenSSL** (to create the isolated test mail certificate)
 
 ### Development
 
@@ -56,7 +57,7 @@ cargo run
 
 The server starts on `http://localhost:2424`. An interactive console is available in the terminal — type `help` for commands.
 
-To run the full test suite (build + DB + server + pytest):
+To run the full test suite (build + isolated database + encrypted test mail server + server + pytest):
 
 ```bash
 python3 tests/run_tests.py

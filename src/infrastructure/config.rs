@@ -97,6 +97,8 @@ pub struct EmailVerificationConfiguration {
     pub subject: String,
     #[serde(default)]
     pub template_path: String,
+    #[serde(default)]
+    pub trusted_root_certificate_path: String,
 }
 
 impl Default for EmailVerificationConfiguration {
@@ -113,6 +115,7 @@ impl Default for EmailVerificationConfiguration {
             verification_url: String::new(),
             subject: default_email_subject(),
             template_path: String::new(),
+            trusted_root_certificate_path: String::new(),
         }
     }
 }
@@ -562,6 +565,9 @@ verification_url = ""
 subject = "Verify your Baihua email address"
 # Optional UTF-8 text file. Supports {{username}}, {{verification_url}}, {{expires_minutes}}.
 template_path = ""
+# Optional trusted certificate for a private mail server. Public mail servers
+# normally need no custom certificate. Certificate verification stays enabled.
+trusted_root_certificate_path = ""
 
 # ---- Rate Limiting ----
 

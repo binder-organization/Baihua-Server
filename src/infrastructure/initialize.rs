@@ -10,6 +10,8 @@ use anyhow::{Context, Result, anyhow};
 use dirs::home_dir;
 use jsonwebtoken::crypto::{CryptoProvider, rust_crypto::DEFAULT_PROVIDER};
 use lettre::message::Mailbox;
+use lettre::transport::smtp::client::Certificate;
+use lettre::transport::smtp::client::TlsParameters;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
@@ -68,6 +70,13 @@ pub async fn initialize(environment: Environment) -> Result<(ServerState, LogSys
         && !template_path.is_empty()
     {
         configuration.email_verification.template_path = template_path;
+    }
+    if let Ok(certificate_path) = std::env::var("BAIHUA_MAIL_TRUSTED_ROOT_CERTIFICATE_PATH")
+        && !certificate_path.is_empty()
+    {
+        configuration
+            .email_verification
+            .trusted_root_certificate_path = certificate_path;
     }
     if let Ok(send_limit) = std::env::var("BAIHUA_MAIL_SENDS_PER_EMAIL_PER_MINUTE")
         && !send_limit.is_empty()
@@ -148,6 +157,25 @@ pub async fn initialize(environment: Environment) -> Result<(ServerState, LogSys
         if !template.contains("{{verification_url}}") {
             anyhow::bail!("The email template must contain {{verification_url}}.");
         }
+    }
+    if !configuration
+        .email_verification
+        .trusted_root_certificate_path
+        .is_empty()
+    {
+        let certificate = fs::read(
+            &configuration
+                .email_verification
+                .trusted_root_certificate_path,
+        )
+        .await
+        .context("Failed to read the trusted mail certificate.")?;
+        let certificate =
+            Certificate::from_pem(&certificate).context("Invalid trusted mail certificate.")?;
+        TlsParameters::builder(configuration.email_verification.server_address.clone())
+            .add_root_certificate(certificate)
+            .build()
+            .context("Failed to configure trusted mail certificate.")?;
     }
     if !configuration.email_verification.username.is_empty()
         && std::env::var("BAIHUA_MAIL_PASSWORD")

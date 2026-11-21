@@ -11,6 +11,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{Duration, Utc};
 use lettre::message::{Mailbox, Message};
 use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
 use lettre::{SmtpTransport, Transport};
 use serde::Deserialize;
 use serde_json::json;
@@ -226,6 +227,7 @@ pub async fn send_verification(state: &ServerState, user_id: Uuid) -> Result<(),
     let security = configuration.security.clone();
     let mail_username = configuration.username.clone();
     let mail_password = std::env::var("BAIHUA_MAIL_PASSWORD").unwrap_or_default();
+    let trusted_root_certificate_path = configuration.trusted_root_certificate_path.clone();
     tokio::task::spawn_blocking(move || {
         let mut builder = if security == "implicit" {
             SmtpTransport::relay(&server_address)
@@ -235,6 +237,21 @@ pub async fn send_verification(state: &ServerState, user_id: Uuid) -> Result<(),
         .map_err(|error| error.to_string())?
         .port(server_port)
         .timeout(Some(StandardDuration::from_secs(10)));
+        if !trusted_root_certificate_path.is_empty() {
+            let certificate =
+                std::fs::read(&trusted_root_certificate_path).map_err(|error| error.to_string())?;
+            let certificate =
+                Certificate::from_pem(&certificate).map_err(|error| error.to_string())?;
+            let parameters = TlsParameters::builder(server_address)
+                .add_root_certificate(certificate)
+                .build()
+                .map_err(|error| error.to_string())?;
+            builder = builder.tls(if security == "implicit" {
+                Tls::Wrapper(parameters)
+            } else {
+                Tls::Required(parameters)
+            });
+        }
         if !mail_username.is_empty() {
             builder = builder.credentials(Credentials::new(mail_username, mail_password));
         }

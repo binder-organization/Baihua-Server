@@ -1,4 +1,27 @@
 services:
+  mail:
+    image: python:3.12-alpine
+    command:
+      - python
+      - /app/mail_server.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "2525"
+      - --directory
+      - /mail/messages
+      - --certificate
+      - /mail/server.pem
+      - --key
+      - /mail/server.key
+    volumes:
+      - ./mail_server.py:/app/mail_server.py:ro
+      - ${BAIHUA_TEST_MAIL_DIRECTORY}:/mail
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 2525), 2).close()"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
   database:
     image: postgres:18
     environment:
@@ -24,12 +47,19 @@ services:
       dockerfile: Dockerfile
     environment:
       BAIHUA_ENV: production
+      BAIHUA_REQUIRE_ENCRYPTED_TRANSPORT: "false"
       BAIHUA_DIR: /app/.baihua
       BIND_HOST: 0.0.0.0
       BAIHUA_ENCRYPTED_GRACE_PERIOD_SECS: ${BAIHUA_ENCRYPTED_GRACE_PERIOD_SECS}
       BAIHUA_REQUEST_TIMEOUT_SECS: "2"
       BAIHUA_MAXIMUM_CONCURRENT_UPLOADS_PER_USER: "1"
       BAIHUA_FILE_UPLOAD_IDLE_TIMEOUT_SECS: "4"
+      BAIHUA_MAIL_SENDER_ADDRESS: ${BAIHUA_MAIL_SENDER_ADDRESS}
+      BAIHUA_MAIL_SERVER_ADDRESS: ${BAIHUA_MAIL_SERVER_ADDRESS}
+      BAIHUA_MAIL_SERVER_PORT: ${BAIHUA_MAIL_SERVER_PORT}
+      BAIHUA_MAIL_SECURITY: ${BAIHUA_MAIL_SECURITY}
+      BAIHUA_MAIL_TRUSTED_ROOT_CERTIFICATE_PATH: ${BAIHUA_MAIL_TRUSTED_ROOT_CERTIFICATE_PATH}
+      BAIHUA_VERIFICATION_BASE_URL: ${BAIHUA_VERIFICATION_BASE_URL}
       JWT_SECRET: ${JWT_SECRET}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -43,8 +73,14 @@ services:
       - type: bind
         source: ${BAIHUA_TEST_FILES_DIRECTORY}
         target: /app/.baihua/files
+      - type: bind
+        source: ${BAIHUA_TEST_MAIL_DIRECTORY}
+        target: /mail
+        read_only: true
     depends_on:
       database:
+        condition: service_healthy
+      mail:
         condition: service_healthy
 
 volumes:

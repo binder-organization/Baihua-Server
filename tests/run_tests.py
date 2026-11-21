@@ -24,6 +24,7 @@ EXPECTED_TEST_CLASSES = (
     "tests/test_group_chat.py::TestGroupChat::",
     "tests/test_encrypted_chat.py::EncryptedChatTest::",
     "tests/test_room_requests.py::RoomRequestChatTest::",
+    "tests/test_email_verification.py::TestEmailVerification::",
 )
 
 
@@ -85,10 +86,17 @@ class TestRun:
         self.test_files_directory = self.temporary_directory / "files"
         self.test_files_directory.mkdir()
         self.test_files_directory.chmod(0o777)
+        self.mail_directory = self.temporary_directory / "mail"
+        self.mail_directory.mkdir()
+        self.mail_directory.chmod(0o777)
+        self.mail_messages_directory = self.mail_directory / "messages"
+        self.mail_messages_directory.mkdir()
+        self.mail_messages_directory.chmod(0o777)
         LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
         self.server_log_path = LOG_DIRECTORY / f"server_{self.identifier}.log"
         self.server_log_file = None
         self.server_process = None
+        self.mail_process = None
         self.compose_started = False
         self.server_url = None
         self.environment = os.environ.copy()
@@ -98,8 +106,77 @@ class TestRun:
             "POSTGRES_DB": f"baihua_test_{self.identifier}",
             "JWT_SECRET": uuid.uuid4().hex + uuid.uuid4().hex,
             "BAIHUA_ENCRYPTED_GRACE_PERIOD_SECS": "5",
+            "BAIHUA_REQUIRE_ENCRYPTED_TRANSPORT": "false",
             "BAIHUA_TEST_FILES_DIRECTORY": str(self.test_files_directory),
+            "BAIHUA_TEST_MAIL_DIRECTORY": str(self.mail_directory),
+            "BAIHUA_TEST_MAIL_MESSAGES_DIRECTORY": str(self.mail_messages_directory),
+            "BAIHUA_MAIL_SENDER_ADDRESS": "verification@example.test",
+            "BAIHUA_MAIL_USERNAME": "",
+            "BAIHUA_MAIL_PASSWORD": "",
+            "BAIHUA_MAIL_SECURITY": "starttls",
         })
+
+    def prepare_mail_certificates(self):
+        root_certificate = self.mail_directory / "root.pem"
+        root_key = self.mail_directory / "root.key"
+        server_certificate = self.mail_directory / "server.pem"
+        server_key = self.mail_directory / "server.key"
+        server_request = self.mail_directory / "server.csr"
+        extensions = self.mail_directory / "server.ext"
+        extensions.write_text(
+            "subjectAltName=DNS:mail,DNS:localhost,IP:127.0.0.1\n"
+            "basicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n",
+            encoding="utf-8",
+        )
+        commands = (
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", str(root_key), "-out", str(root_certificate),
+             "-days", "1", "-subj", "/CN=Baihua Test Mail Root",
+             "-addext", "basicConstraints=critical,CA:TRUE"],
+            ["openssl", "req", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", str(server_key), "-out", str(server_request),
+             "-subj", "/CN=mail"],
+            ["openssl", "x509", "-req", "-in", str(server_request),
+             "-CA", str(root_certificate), "-CAkey", str(root_key),
+             "-CAcreateserial", "-out", str(server_certificate),
+             "-days", "1", "-extfile", str(extensions)],
+        )
+        for command in commands:
+            result = subprocess.run(command, capture_output=True, text=True)
+            if result.returncode:
+                raise RuntimeError(result.stderr or result.stdout)
+        self.environment["BAIHUA_MAIL_TRUSTED_ROOT_CERTIFICATE_PATH"] = str(root_certificate)
+
+    def start_local_mail(self):
+        mail_port = choose_port()
+        self.mail_process = subprocess.Popen(
+            [sys.executable, str(PROJECT_ROOT / "tests" / "mail_server.py"),
+             "--host", "127.0.0.1", "--port", str(mail_port),
+             "--directory", str(self.mail_messages_directory),
+             "--certificate", str(self.mail_directory / "server.pem"),
+             "--key", str(self.mail_directory / "server.key")],
+            cwd=PROJECT_ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        self.environment["BAIHUA_MAIL_SERVER_ADDRESS"] = "127.0.0.1"
+        self.environment["BAIHUA_MAIL_SERVER_PORT"] = str(mail_port)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if self.mail_process.poll() is not None:
+                raise RuntimeError("The test mail server exited before startup.")
+            try:
+                with socket.create_connection(("127.0.0.1", mail_port), timeout=1):
+                    return
+            except OSError:
+                time.sleep(0.1)
+        raise RuntimeError("The test mail server did not start.")
+
+    def start_container_mail(self):
+        self.environment["BAIHUA_MAIL_SERVER_ADDRESS"] = "mail"
+        self.environment["BAIHUA_MAIL_SERVER_PORT"] = "2525"
+        self.environment["BAIHUA_MAIL_TRUSTED_ROOT_CERTIFICATE_PATH"] = "/mail/root.pem"
+        self.compose("up", "-d", "--wait", "mail")
 
     def compose_command(self, *arguments):
         return [
@@ -178,6 +255,7 @@ class TestRun:
         port = choose_port()
         self.write_server_configuration(port)
         self.environment["BAIHUA_ENV"] = "production"
+        self.environment["BAIHUA_VERIFICATION_BASE_URL"] = f"https://localhost:{port}"
         self.server_log_file = self.server_log_path.open("w", encoding="utf-8")
         self.server_process = subprocess.Popen(
             [str(binary)],
@@ -191,6 +269,7 @@ class TestRun:
         self.wait_until_healthy()
 
     def start_container_server(self):
+        self.environment["BAIHUA_VERIFICATION_BASE_URL"] = "https://localhost:2424"
         self.compose("--profile", "container", "up", "-d", "--build", "--wait", "server", timeout=1200)
         port = self.mapped_port("server", 2424, profile="container")
         self.server_url = f"http://127.0.0.1:{port}"
@@ -245,6 +324,9 @@ class TestRun:
         ).returncode
 
     def cleanup(self):
+        if self.mail_process is not None and self.mail_process.poll() is None:
+            self.mail_process.terminate()
+            self.mail_process.wait(timeout=5)
         if self.server_process is not None and self.server_process.poll() is None:
             self.server_process.terminate()
             try:
@@ -293,13 +375,16 @@ def run():
     test_run = TestRun(container_mode=arguments.docker)
     completed = False
     try:
+        test_run.prepare_mail_certificates()
         if arguments.local:
             test_run.use_explicit_local_database()
         else:
             test_run.start_database()
         if arguments.docker:
+            test_run.start_container_mail()
             test_run.start_container_server()
         else:
+            test_run.start_local_mail()
             test_run.start_local_server()
         result = test_run.run_tests(arguments)
         completed = True

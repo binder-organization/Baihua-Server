@@ -70,12 +70,13 @@ Baihua uses **Python pytest** for HTTP integration tests against a running serve
 
 ### Prerequisites
 
-- **Docker** (for PostgreSQL database via `docker compose`)
+- **Docker** (for the isolated PostgreSQL database and container mail server)
 - **Python 3.10+** with `pip install -r tests/requirements.txt`
+- **OpenSSL** (to create the isolated test mail certificate)
 
 ### Run Tests
 
-The test runner handles the full lifecycle: build the Rust binary, start the database, launch the server, run tests, and clean up.
+The test runner handles the full lifecycle: create a trusted test certificate, start an encrypted mail receiver and database, build and launch the server, run tests, and clean up.
 
 ```bash
 # Default mode (recommended): DB in Docker, server binary local
