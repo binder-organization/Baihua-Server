@@ -1,5 +1,7 @@
 import re
+import struct
 import uuid
+import zlib
 
 import pytest
 import requests
@@ -977,7 +979,24 @@ class TestProfileBioAvatar:
 class TestAvatarUpload:
     """POST /api/v1/user/me/avatar uploads an image stored under /static/avatars/."""
 
-    PNG_PAYLOAD = b"\x89PNG\r\n\x1a\n" + b"x" * 100
+    @staticmethod
+    def image_payload(
+        color: bytes = b"\xff\x00\x00", width: int = 1, height: int = 1
+    ) -> bytes:
+        def chunk(name: bytes, data: bytes) -> bytes:
+            return (
+                struct.pack(">I", len(data))
+                + name
+                + data
+                + struct.pack(">I", zlib.crc32(name + data))
+            )
+
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\x00" + color))
+            + chunk(b"IEND", b"")
+        )
 
     @staticmethod
     def _register_and_login(
@@ -1004,18 +1023,16 @@ class TestAvatarUpload:
     def test_upload_avatar_success(
         self, session: requests.Session, base_url: str
     ) -> None:
-        token, _ = self._register_and_login(session, base_url, prefix="avtup")
+        token, user = self._register_and_login(session, base_url, prefix="avtup")
         resp = session.post(
             f"{base_url}/api/v1/user/me/avatar",
-            files={"file": ("a.png", self.PNG_PAYLOAD, "image/png")},
+            files={"file": ("a.png", self.image_payload(), "image/png")},
             headers=_auth(token),
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["code"] == "SUCCESS"
-        assert re.match(
-            r"^/static/avatars/[0-9a-f-]{36}\.png$", body["data"]["user"]["avatar"]
-        ), body["data"]["user"]["avatar"]
+        assert body["data"]["user"]["avatar"] == f"/static/avatars/{user['id']}.png"
 
     def test_serve_uploaded_avatar(
         self, session: requests.Session, base_url: str
@@ -1023,7 +1040,7 @@ class TestAvatarUpload:
         token, _ = self._register_and_login(session, base_url, prefix="avtsrv")
         upload = session.post(
             f"{base_url}/api/v1/user/me/avatar",
-            files={"file": ("a.png", self.PNG_PAYLOAD, "image/png")},
+            files={"file": ("a.png", self.image_payload(), "image/png")},
             headers=_auth(token),
         )
         assert upload.status_code == 200, upload.text
@@ -1032,14 +1049,73 @@ class TestAvatarUpload:
         resp = session.get(f"{base_url}{avatar_path}")
         assert resp.status_code == 200, resp.text
         assert resp.headers["Content-Type"] == "image/png"
-        assert resp.content == self.PNG_PAYLOAD
+        assert resp.content.startswith(b"\x89PNG\r\n\x1a\n")
+        assert resp.headers["Cache-Control"] == "no-store"
+
+    def test_replacement_uses_user_filename(
+        self, session: requests.Session, base_url: str
+    ) -> None:
+        token, user = self._register_and_login(session, base_url, prefix="avtreplace")
+        first = session.post(
+            f"{base_url}/api/v1/user/me/avatar",
+            files={"file": ("first.png", self.image_payload(), "image/png")},
+            headers=_auth(token),
+        )
+        first_bytes = session.get(f"{base_url}/static/avatars/{user['id']}.png").content
+        second = session.post(
+            f"{base_url}/api/v1/user/me/avatar",
+            files={"file": ("second.png", self.image_payload(b"\x00\xff\x00"), "image/png")},
+            headers=_auth(token),
+        )
+        assert first.status_code == second.status_code == 200
+        expected_path = f"/static/avatars/{user['id']}.png"
+        assert first.json()["data"]["user"]["avatar"] == expected_path
+        assert second.json()["data"]["user"]["avatar"] == expected_path
+        assert session.get(f"{base_url}{expected_path}").content != first_bytes
+
+    def test_rejects_spoofed_image_content(
+        self, session: requests.Session, base_url: str
+    ) -> None:
+        token, user = self._register_and_login(session, base_url, prefix="avtspoof")
+        response = session.post(
+            f"{base_url}/api/v1/user/me/avatar",
+            files={"file": ("malicious.png", b"\x89PNG\r\n\x1a\n<script>alert(1)</script>", "image/png")},
+            headers=_auth(token),
+        )
+        assert response.status_code == 400
+        assert response.json()["code"] == "VALIDATION_ERROR"
+        assert session.get(f"{base_url}/static/avatars/{user['id']}.png").status_code == 404
+
+    def test_rejects_mismatched_media_type(
+        self, session: requests.Session, base_url: str
+    ) -> None:
+        token, _ = self._register_and_login(session, base_url, prefix="avtmismatch")
+        response = session.post(
+            f"{base_url}/api/v1/user/me/avatar",
+            files={"file": ("disguised.jpg", self.image_payload(), "image/jpeg")},
+            headers=_auth(token),
+        )
+        assert response.status_code == 400
+        assert "does not match" in response.json()["message"]
+
+    def test_rejects_excessive_source_pixels(
+        self, session: requests.Session, base_url: str
+    ) -> None:
+        token, _ = self._register_and_login(session, base_url, prefix="avtpixels")
+        response = session.post(
+            f"{base_url}/api/v1/user/me/avatar",
+            files={"file": ("huge.png", self.image_payload(width=5000, height=5000), "image/png")},
+            headers=_auth(token),
+        )
+        assert response.status_code == 400
+        assert "dimensions exceed" in response.json()["message"]
 
     def test_upload_requires_auth(
         self, session: requests.Session, base_url: str
     ) -> None:
         resp = session.post(
             f"{base_url}/api/v1/user/me/avatar",
-            files={"file": ("a.png", self.PNG_PAYLOAD, "image/png")},
+            files={"file": ("a.png", self.image_payload(), "image/png")},
         )
         assert resp.status_code == 401, resp.text
         assert resp.json()["code"] == "AUTHENTICATION_ERROR"

@@ -305,12 +305,18 @@ impl Default for RoomRequestConfiguration {
 pub struct AvatarConfiguration {
     #[serde(default = "default_avatar_max_bytes")]
     pub max_bytes: u32,
+    #[serde(default = "default_avatar_maximum_source_pixels")]
+    pub maximum_source_pixels: u64,
+    #[serde(default = "default_avatar_maximum_dimension")]
+    pub maximum_dimension: u32,
 }
 
 impl Default for AvatarConfiguration {
     fn default() -> Self {
         Self {
             max_bytes: default_avatar_max_bytes(),
+            maximum_source_pixels: default_avatar_maximum_source_pixels(),
+            maximum_dimension: default_avatar_maximum_dimension(),
         }
     }
 }
@@ -424,6 +430,12 @@ fn default_room_request_send_daily_limit() -> u32 {
 fn default_avatar_max_bytes() -> u32 {
     2 * 1024 * 1024 // 2 MB
 }
+fn default_avatar_maximum_source_pixels() -> u64 {
+    16_000_000
+}
+fn default_avatar_maximum_dimension() -> u32 {
+    512
+}
 fn default_file_max_bytes() -> u64 {
     5 * 1024 * 1024 * 1024 // 5 GB
 }
@@ -467,9 +479,7 @@ impl Default for ServerConfiguration {
             rate_limit: RateLimitConfiguration::default(),
             websocket: WebSocketConfiguration::default(),
             room_request: RoomRequestConfiguration::default(),
-            avatar: AvatarConfiguration {
-                max_bytes: default_avatar_max_bytes(),
-            },
+            avatar: AvatarConfiguration::default(),
             file: FileConfiguration::default(),
         }
     }
@@ -693,6 +703,13 @@ send_daily_limit = 20
 # Uploads exceeding this size are rejected with a 413 Payload Too Large.
 max_bytes = 2097152
 
+# Reject source images above this pixel count before decoding.
+# This limits decompression bombs even when the uploaded file is small.
+maximum_source_pixels = 16000000
+
+# Resize the processed avatar to fit within this width and height.
+maximum_dimension = 512
+
 # ---- Files ----
 
 [file]
@@ -834,6 +851,9 @@ download_mibps = 0
 
         if self.avatar.max_bytes == 0 {
             bail!("The avatar max bytes cannot be 0.");
+        }
+        if self.avatar.maximum_source_pixels == 0 || self.avatar.maximum_dimension == 0 {
+            bail!("The avatar image dimensions cannot be 0.");
         }
         if self.file.max_bytes == 0 {
             bail!("The file max bytes cannot be 0.");

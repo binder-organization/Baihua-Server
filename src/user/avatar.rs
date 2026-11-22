@@ -8,23 +8,75 @@ use axum::extract::multipart::{Field, Multipart};
 use axum::extract::{Path, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
+use image::{ImageFormat, ImageReader};
 use lazy_static::lazy_static;
 use regex::Regex;
 use sqlx::Row;
+use std::io::Cursor;
 use std::sync::Arc;
 use tracing::warn;
 use uuid::Uuid;
 
 const AVATAR_URL_PREFIX: &str = "/static/avatars/";
 
-fn extension_for_content_type(content_type: &str) -> Option<&'static str> {
+fn format_for_content_type(content_type: &str) -> Option<ImageFormat> {
     match content_type {
-        "image/jpeg" => Some("jpg"),
-        "image/png" => Some("png"),
-        "image/gif" => Some("gif"),
-        "image/webp" => Some("webp"),
+        "image/jpeg" => Some(ImageFormat::Jpeg),
+        "image/png" => Some(ImageFormat::Png),
+        "image/gif" => Some(ImageFormat::Gif),
+        "image/webp" => Some(ImageFormat::WebP),
         _ => None,
     }
+}
+
+fn process_image(
+    bytes: Vec<u8>,
+    claimed_format: ImageFormat,
+    maximum_source_pixels: u64,
+    maximum_dimension: u32,
+) -> Result<Vec<u8>, ErrorResponse> {
+    let actual_format = image::guess_format(&bytes)
+        .map_err(|_| ErrorResponse::Validation("Avatar image content is invalid.".to_string()))?;
+    if actual_format != claimed_format {
+        return Err(ErrorResponse::Validation(
+            "Avatar image content does not match its media type.".to_string(),
+        ));
+    }
+    let dimensions = ImageReader::with_format(Cursor::new(&bytes), actual_format)
+        .into_dimensions()
+        .map_err(|_| ErrorResponse::Validation("Avatar image content is invalid.".to_string()))?;
+    if dimensions.0 == 0
+        || dimensions.1 == 0
+        || u64::from(dimensions.0) * u64::from(dimensions.1) > maximum_source_pixels
+    {
+        return Err(ErrorResponse::Validation(
+            "Avatar image dimensions exceed the configured limit.".to_string(),
+        ));
+    }
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), actual_format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(dimensions.0);
+    limits.max_image_height = Some(dimensions.1);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .map_err(|_| ErrorResponse::Validation("Avatar image content is invalid.".to_string()))?;
+    // Re-encoding a bounded image drops metadata and keeps supplied bytes out of public storage.
+    let processed = decoded.thumbnail(maximum_dimension, maximum_dimension);
+    let mut output = Cursor::new(Vec::new());
+    processed
+        .write_to(&mut output, ImageFormat::Png)
+        .map_err(|error| {
+            warn!("Failed to encode avatar image: {error}");
+            ErrorResponse::ServiceUnavailable("Avatar upload failed. Please try again.".to_string())
+        })?;
+    Ok(output.into_inner())
+}
+
+fn upload_retry_error(error: impl std::fmt::Display) -> ErrorResponse {
+    warn!("Avatar upload failed: {error}");
+    ErrorResponse::ServiceUnavailable("Avatar upload failed. Please try again.".to_string())
 }
 
 // Upload an avatar image file, store it on the local filesystem and point
@@ -63,8 +115,8 @@ async fn process_avatar_field(
             ));
         }
     };
-    let extension = match extension_for_content_type(content_type) {
-        Some(extension) => extension,
+    let claimed_format = match format_for_content_type(content_type) {
+        Some(format) => format,
         None => {
             return Err(ErrorResponse::Validation(
                 "Avatar must be a JPEG, PNG, GIF or WebP image.".to_string(),
@@ -99,14 +151,34 @@ async fn process_avatar_field(
         ));
     }
 
-    let filename = format!("{}.{}", Uuid::now_v7(), extension);
+    let maximum_source_pixels = state.configuration.avatar.maximum_source_pixels;
+    let maximum_dimension = state.configuration.avatar.maximum_dimension;
+    let processed_bytes = tokio::task::spawn_blocking(move || {
+        process_image(
+            bytes,
+            claimed_format,
+            maximum_source_pixels,
+            maximum_dimension,
+        )
+    })
+    .await
+    .map_err(upload_retry_error)??;
 
-    // A previously uploaded avatar is removed only after the new file is
-    // safely written, so a failed upload never leaves the user without one.
-    let previous_avatar = sqlx::query("SELECT avatar FROM users WHERE id = $1")
+    let filename = format!("{}.png", auth_user.user_id);
+    let target_path = state.avatars_directory.join(&filename);
+    let temporary_path = state
+        .avatars_directory
+        .join(format!("{}.part", Uuid::now_v7()));
+    let backup_path = state
+        .avatars_directory
+        .join(format!("{}.backup", Uuid::now_v7()));
+    let mut transaction = state.pool.begin().await.map_err(upload_retry_error)?;
+    // Serialize replacements so concurrent uploads cannot delete each other's new avatar.
+    let previous_avatar = sqlx::query("SELECT avatar FROM users WHERE id = $1 FOR UPDATE")
         .bind(auth_user.user_id)
-        .fetch_one(&state.pool)
-        .await?
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(upload_retry_error)?
         .get::<Option<String>, _>("avatar");
 
     let old_filename = previous_avatar
@@ -114,20 +186,55 @@ async fn process_avatar_field(
         .and_then(|avatar| avatar.strip_prefix(AVATAR_URL_PREFIX))
         .map(str::to_string);
 
-    tokio::fs::write(state.avatars_directory.join(&filename), &bytes)
-        .await
-        .map_err(|err| {
-            ErrorResponse::InternalError(format!("Failed to save avatar file: {}.", err))
-        })?;
+    if let Err(error) = tokio::fs::write(&temporary_path, processed_bytes).await {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+        return Err(upload_retry_error(error));
+    }
+    let previous_file_exists = match tokio::fs::try_exists(&target_path).await {
+        Ok(exists) => exists,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary_path).await;
+            return Err(upload_retry_error(error));
+        }
+    };
+    if previous_file_exists
+        && let Err(error) = tokio::fs::hard_link(&target_path, &backup_path).await
+    {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+        return Err(upload_retry_error(error));
+    }
+    if let Err(error) = tokio::fs::rename(&temporary_path, &target_path).await {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+        let _ = tokio::fs::remove_file(&backup_path).await;
+        return Err(upload_retry_error(error));
+    }
 
     let avatar_url = format!("{}{}", AVATAR_URL_PREFIX, filename);
-    sqlx::query("UPDATE users SET avatar = $1 WHERE id = $2")
+    let save_result = sqlx::query("UPDATE users SET avatar = $1 WHERE id = $2")
         .bind(&avatar_url)
         .bind(auth_user.user_id)
-        .execute(&state.pool)
-        .await?;
+        .execute(&mut *transaction)
+        .await
+        .map_err(upload_retry_error);
+    let save_result = match save_result {
+        Ok(_) => transaction.commit().await.map_err(upload_retry_error),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = save_result {
+        if previous_file_exists {
+            if let Err(restore_error) = tokio::fs::rename(&backup_path, &target_path).await {
+                warn!("Failed to restore previous avatar: {restore_error}");
+            }
+        } else {
+            let _ = tokio::fs::remove_file(&target_path).await;
+        }
+        return Err(error);
+    }
+    if previous_file_exists {
+        let _ = tokio::fs::remove_file(&backup_path).await;
+    }
 
-    if let Some(old_filename) = old_filename
+    if let Some(old_filename) = old_filename.filter(|old_filename| old_filename != &filename)
         && let Err(err) = tokio::fs::remove_file(state.avatars_directory.join(&old_filename)).await
     {
         warn!(
@@ -142,6 +249,7 @@ async fn process_avatar_field(
         "Avatar uploaded successfully.".to_string(),
     )
     .await
+    .map_err(upload_retry_error)
 }
 
 // Serve an uploaded avatar file by its unguessable UUID filename. Public
@@ -191,5 +299,13 @@ pub async fn serve_avatar_file(
         }
     };
 
-    Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
