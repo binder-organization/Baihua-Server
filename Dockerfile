@@ -21,11 +21,14 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libssl-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the entire project and build the release binary
 COPY Cargo.toml Cargo.lock ./
+RUN mkdir src \
+    && printf 'fn main() {}\n' > src/main.rs \
+    && cargo build --release --locked
+
 COPY src/ src/
 COPY migrations/ migrations/
-RUN cargo build --release --locked
+RUN touch src/main.rs && cargo build --release --locked
 
 # Stage 2: Runtime ------------------------------------------------------------
 FROM debian:bookworm-slim

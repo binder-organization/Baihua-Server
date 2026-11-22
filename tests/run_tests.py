@@ -271,7 +271,15 @@ class TestRun:
 
     def start_container_server(self):
         self.environment["BAIHUA_VERIFICATION_BASE_URL"] = "https://localhost:2424"
-        self.compose("--profile", "container", "up", "-d", "--build", "--wait", "server", timeout=1200)
+        build_options = (
+            ("--no-build", "--pull", "never")
+            if self.environment.get("BAIHUA_TEST_PREBUILT_IMAGE") == "1"
+            else ("--build",)
+        )
+        self.compose(
+            "--profile", "container", "up", "-d", *build_options,
+            "--wait", "server", timeout=1200,
+        )
         port = self.mapped_port("server", 2424, profile="container")
         self.server_url = f"http://127.0.0.1:{port}"
         self.wait_until_healthy()
@@ -317,7 +325,10 @@ class TestRun:
     def run_tests(self, arguments):
         self.environment["BAIHUA_TEST_BASE_URL"] = self.server_url
         selected = arguments.test or ["tests"]
-        command = [sys.executable, "-m", "pytest", *selected, "-v", "--tb=short"]
+        command = [
+            sys.executable, "-m", "pytest", *selected,
+            "-v", "--tb=short", "--durations=20",
+        ]
         if arguments.smoke:
             command.extend(["-m", "smoke"])
         return subprocess.run(

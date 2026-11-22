@@ -13,8 +13,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: build integration server image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: baihua-server-integration:latest
+          cache-from: type=gha,scope=integration
+          cache-to: type=gha,mode=max,scope=integration
+
       - name: install python deps
         run: pip install -r tests/requirements.txt
 
       - name: integration tests
+        env:
+          BAIHUA_TEST_PREBUILT_IMAGE: "1"
         run: python3 tests/run_tests.py --docker --skip-checks
